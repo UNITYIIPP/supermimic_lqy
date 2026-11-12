@@ -1,0 +1,1046 @@
+{
+  "method": "Source network classes instantiated on torch meta device; closed-form counts cross-checked. Checkpoint tensors read using FakeTensorMode, weights_only=True and mmap=True. Buffers and optimizer states excluded.",
+  "supermimic": [
+    {
+      "name": "gencoord_default",
+      "dimensions": {
+        "world_model": [
+          130,
+          2048,
+          2048,
+          2048,
+          35
+        ],
+        "motion_encoder": [
+          640,
+          2048,
+          1024,
+          512,
+          256,
+          32
+        ],
+        "velocity_encoder": [
+          3,
+          2048,
+          1024,
+          512,
+          256,
+          32
+        ],
+        "decoder": [
+          100,
+          2048,
+          1024,
+          512,
+          256,
+          29
+        ],
+        "critic": [
+          771,
+          256,
+          128,
+          1
+        ]
+      },
+      "parameters": {
+        "world_model": 8744995,
+        "motion_encoder": 4082976,
+        "velocity_encoder": 2778400,
+        "decoder": 2976285,
+        "critic": 231425,
+        "actor_motion_path": 7059261,
+        "actor_registered": 9837661,
+        "total_registered": 18814081,
+        "total_motion_path": 16035681
+      },
+      "context_dim_assumption": 33
+    },
+    {
+      "name": "gencoord_proprio_history10",
+      "dimensions": {
+        "world_model": [
+          130,
+          2048,
+          2048,
+          2048,
+          35
+        ],
+        "motion_encoder": [
+          640,
+          2048,
+          1024,
+          512,
+          256,
+          32
+        ],
+        "velocity_encoder": [
+          3,
+          2048,
+          1024,
+          512,
+          256,
+          32
+        ],
+        "decoder": [
+          962,
+          2048,
+          1024,
+          512,
+          256,
+          29
+        ],
+        "critic": [
+          771,
+          256,
+          128,
+          1
+        ]
+      },
+      "parameters": {
+        "world_model": 8744995,
+        "motion_encoder": 4082976,
+        "velocity_encoder": 2778400,
+        "decoder": 4741661,
+        "critic": 231425,
+        "actor_motion_path": 8824637,
+        "actor_registered": 11603037,
+        "total_registered": 20579457,
+        "total_motion_path": 17801057
+      },
+      "context_dim_assumption": 33
+    },
+    {
+      "name": "maxcoord_14bodies",
+      "dimensions": {
+        "world_model": [
+          276,
+          2048,
+          2048,
+          2048,
+          84
+        ],
+        "motion_encoder": [
+          640,
+          2048,
+          1024,
+          512,
+          256,
+          32
+        ],
+        "velocity_encoder": [
+          3,
+          2048,
+          1024,
+          512,
+          256,
+          32
+        ],
+        "decoder": [
+          246,
+          2048,
+          1024,
+          512,
+          256,
+          29
+        ],
+        "critic": [
+          917,
+          256,
+          128,
+          1
+        ]
+      },
+      "parameters": {
+        "world_model": 9144404,
+        "motion_encoder": 4082976,
+        "velocity_encoder": 2778400,
+        "decoder": 3275293,
+        "critic": 268801,
+        "actor_motion_path": 7358269,
+        "actor_registered": 10136669,
+        "total_registered": 19549874,
+        "total_motion_path": 16771474
+      },
+      "context_dim_assumption": 33
+    }
+  ],
+  "allmimic": [
+    {
+      "name": "default",
+      "dimensions": {
+        "world_model": [
+          307,
+          2048,
+          2048,
+          2048,
+          70
+        ],
+        "motion_encoder": [
+          730,
+          2048,
+          1024,
+          512,
+          256,
+          32
+        ],
+        "decoder": [
+          962,
+          2048,
+          1024,
+          512,
+          256,
+          29
+        ],
+        "critic": [
+          1009,
+          256,
+          128,
+          1
+        ]
+      },
+      "parameters": {
+        "world_model": 9166918,
+        "motion_encoder": 4259616,
+        "decoder": 4733981,
+        "critic": 291585,
+        "actor": 8993597,
+        "total": 18452100
+      }
+    },
+    {
+      "name": "recommended",
+      "dimensions": {
+        "world_model": [
+          307,
+          2048,
+          2048,
+          2048,
+          70
+        ],
+        "motion_encoder": [
+          730,
+          2048,
+          1024,
+          512,
+          256,
+          128
+        ],
+        "decoder": [
+          1058,
+          2048,
+          1024,
+          512,
+          256,
+          29
+        ],
+        "critic": [
+          1009,
+          256,
+          128,
+          1
+        ]
+      },
+      "parameters": {
+        "world_model": 9166918,
+        "motion_encoder": 4284288,
+        "decoder": 4930589,
+        "critic": 291585,
+        "actor": 9214877,
+        "total": 18673380
+      }
+    },
+    {
+      "name": "root-feedback",
+      "dimensions": {
+        "world_model": [
+          307,
+          2048,
+          2048,
+          2048,
+          70
+        ],
+        "motion_encoder": [
+          730,
+          2048,
+          1024,
+          512,
+          256,
+          128
+        ],
+        "decoder": [
+          1118,
+          2048,
+          1024,
+          512,
+          256,
+          29
+        ],
+        "critic": [
+          1099,
+          256,
+          128,
+          1
+        ]
+      },
+      "parameters": {
+        "world_model": 9166918,
+        "motion_encoder": 4284288,
+        "decoder": 5053469,
+        "critic": 314625,
+        "actor": 9337757,
+        "total": 18819300
+      }
+    },
+    {
+      "name": "root-feedback-delay",
+      "dimensions": {
+        "world_model": [
+          340,
+          2048,
+          2048,
+          2048,
+          70
+        ],
+        "motion_encoder": [
+          730,
+          2048,
+          1024,
+          512,
+          256,
+          128
+        ],
+        "decoder": [
+          1118,
+          2048,
+          1024,
+          512,
+          256,
+          29
+        ],
+        "critic": [
+          1132,
+          256,
+          128,
+          1
+        ]
+      },
+      "parameters": {
+        "world_model": 9234502,
+        "motion_encoder": 4284288,
+        "decoder": 5053469,
+        "critic": 323073,
+        "actor": 9337757,
+        "total": 18895332
+      }
+    }
+  ],
+  "checkpoints": [
+    {
+      "path": "/mnt/dataset/lqi3lr/dyh/allmimic/runs/evt2_simple_action_delay_seed_lafan_filter1/last.pt",
+      "iteration": 96000,
+      "cfg": {
+        "motions": "data/processed/evt_seed_lafan_train_flat_v1_grounded_filtered.npz",
+        "clip_prefixes": "",
+        "clip_list": "data/infeasible/evt_seed_lafan_filtered_feasible.txt",
+        "softmax_cap": 50.0,
+        "out": "runs/evt2_simple_action_delay_seed_lafan_filter1",
+        "seed": 0,
+        "num_envs": 4096,
+        "buffer_steps": 1000,
+        "iterations": 320000,
+        "utd": 0.4,
+        "warmup_steps": 64,
+        "k": 8,
+        "wm_batch": 2048,
+        "wm_batches": 10,
+        "horizon": 32,
+        "pi_batch": 4096,
+        "gamma": 0.99,
+        "lam": 0.95,
+        "lr": 0.0004,
+        "lr_final_frac": 0.03,
+        "lr_decay_iters": 250000,
+        "critic_epochs": 5,
+        "critic_minibatches": 4,
+        "action_noise": 0.1,
+        "collect_det_frac": 0.25,
+        "img_action_noise": 0.0,
+        "pi_clip": 0.03125,
+        "critic_heads": 1,
+        "value_clip": true,
+        "wm_rot_out": "axis",
+        "clean_prev_action": false,
+        "w_residual": 0.0,
+        "retire_g": 0.0,
+        "bptt_detach": 0,
+        "gap_every": 0,
+        "gap_envs": 256,
+        "bin_prior": "",
+        "bin_prior_alpha": 0.3,
+        "optimizer": "adam",
+        "use_critic": true,
+        "log_every": 100,
+        "ckpt_every": 4000,
+        "eval_every": 4000,
+        "eval_clips": 0,
+        "eval_envs": 4096,
+        "wall_hours": 1000000000.0,
+        "tf32": true,
+        "amp": true,
+        "compile_wm": true,
+        "wm_compile_mode": "reduce-overhead",
+        "lr_sqrt_world": true,
+        "norm_update_every": 5,
+        "resume": "",
+        "goal_pos": "current_ref",
+        "goal_rot": "current_ref",
+        "critic_future_root": true,
+        "actor_ref_orientation": true,
+        "noise_ref_orientation": 0.05,
+        "goal_pos_noise": 0.0,
+        "action": "res",
+        "res_scale": 1.0,
+        "future_offsets": "",
+        "latent": 128,
+        "compile_bptt": "reduce-overhead",
+        "bptt_checkpoint": 0,
+        "heading": "xaxis",
+        "res_legs": "abs",
+        "res_scale_legs": 0.0,
+        "wm_joint_weights": "tracked",
+        "wm_joint_weight_clip": 4.0,
+        "wm_norm_eps": 0.001,
+        "rot_repr": "6d",
+        "robot": "evt",
+        "action_delay": true,
+        "delay_legs": "0,4",
+        "delay_feet": "0,4",
+        "delay_waist": "0,4",
+        "delay_arms": "0,4",
+        "delay_eval": "max"
+      },
+      "components": {
+        "wm": {
+          "parameters": 9234502,
+          "shapes": {
+            "net.0.weight": [
+              2048,
+              340
+            ],
+            "net.0.bias": [
+              2048
+            ],
+            "net.2.weight": [
+              2048,
+              2048
+            ],
+            "net.2.bias": [
+              2048
+            ],
+            "net.4.weight": [
+              2048,
+              2048
+            ],
+            "net.4.bias": [
+              2048
+            ],
+            "net.6.weight": [
+              70,
+              2048
+            ],
+            "net.6.bias": [
+              70
+            ]
+          }
+        },
+        "policy": {
+          "parameters": 9337757,
+          "shapes": {
+            "encoder.0.weight": [
+              2048,
+              730
+            ],
+            "encoder.0.bias": [
+              2048
+            ],
+            "encoder.2.weight": [
+              1024,
+              2048
+            ],
+            "encoder.2.bias": [
+              1024
+            ],
+            "encoder.4.weight": [
+              512,
+              1024
+            ],
+            "encoder.4.bias": [
+              512
+            ],
+            "encoder.6.weight": [
+              256,
+              512
+            ],
+            "encoder.6.bias": [
+              256
+            ],
+            "encoder.8.weight": [
+              128,
+              256
+            ],
+            "encoder.8.bias": [
+              128
+            ],
+            "decoder.0.weight": [
+              2048,
+              1118
+            ],
+            "decoder.0.bias": [
+              2048
+            ],
+            "decoder.2.weight": [
+              1024,
+              2048
+            ],
+            "decoder.2.bias": [
+              1024
+            ],
+            "decoder.4.weight": [
+              512,
+              1024
+            ],
+            "decoder.4.bias": [
+              512
+            ],
+            "decoder.6.weight": [
+              256,
+              512
+            ],
+            "decoder.6.bias": [
+              256
+            ],
+            "decoder.8.weight": [
+              29,
+              256
+            ],
+            "decoder.8.bias": [
+              29
+            ]
+          }
+        },
+        "critic": {
+          "parameters": 323073,
+          "shapes": {
+            "net.0.weight": [
+              256,
+              1132
+            ],
+            "net.0.bias": [
+              256
+            ],
+            "net.2.weight": [
+              128,
+              256
+            ],
+            "net.2.bias": [
+              128
+            ],
+            "net.4.weight": [
+              1,
+              128
+            ],
+            "net.4.bias": [
+              1
+            ]
+          }
+        }
+      },
+      "parameters_total": 18895332,
+      "physics_summary": {
+        "model": "evt2_simple",
+        "actuation": "torque_pd",
+        "physics_dt_s": 0.005,
+        "control_dt_s": 0.02,
+        "decimation": 4,
+        "robot_bodies": 30,
+        "robot_mass_kg": 63.272147999999994
+      }
+    },
+    {
+      "path": "/mnt/dataset/lqi3lr/dyh/allmimic/runs/evt2_simple_action_delay_latent32_lr4/last.pt",
+      "iteration": 40000,
+      "cfg": {
+        "motions": "data/processed/evt_lafan1_50hz.npz",
+        "clip_prefixes": "",
+        "clip_list": "",
+        "softmax_cap": 50.0,
+        "out": "runs/evt2_simple_action_delay_latent32_lr4",
+        "seed": 0,
+        "num_envs": 4096,
+        "buffer_steps": 1000,
+        "iterations": 320000,
+        "utd": 0.4,
+        "warmup_steps": 64,
+        "k": 8,
+        "wm_batch": 2048,
+        "wm_batches": 10,
+        "horizon": 32,
+        "pi_batch": 4096,
+        "gamma": 0.99,
+        "lam": 0.95,
+        "lr": 0.0008,
+        "lr_final_frac": 0.03,
+        "lr_decay_iters": 250000,
+        "critic_epochs": 5,
+        "critic_minibatches": 4,
+        "action_noise": 0.1,
+        "collect_det_frac": 0.25,
+        "img_action_noise": 0.0,
+        "pi_clip": 0.03125,
+        "critic_heads": 1,
+        "value_clip": true,
+        "wm_rot_out": "axis",
+        "clean_prev_action": false,
+        "w_residual": 0.0,
+        "retire_g": 0.0,
+        "bptt_detach": 0,
+        "gap_every": 0,
+        "gap_envs": 256,
+        "bin_prior": "",
+        "bin_prior_alpha": 0.3,
+        "optimizer": "adam",
+        "use_critic": true,
+        "log_every": 100,
+        "ckpt_every": 4000,
+        "eval_every": 4000,
+        "eval_clips": 0,
+        "eval_envs": 4096,
+        "wall_hours": 1000000000.0,
+        "tf32": true,
+        "amp": true,
+        "compile_wm": true,
+        "wm_compile_mode": "reduce-overhead",
+        "lr_sqrt_world": true,
+        "norm_update_every": 5,
+        "resume": "",
+        "goal_pos": "current_ref",
+        "goal_rot": "current_ref",
+        "critic_future_root": true,
+        "actor_ref_orientation": true,
+        "noise_ref_orientation": 0.05,
+        "goal_pos_noise": 0.0,
+        "action": "res",
+        "res_scale": 1.0,
+        "future_offsets": "",
+        "latent": 32,
+        "compile_bptt": "reduce-overhead",
+        "bptt_checkpoint": 0,
+        "heading": "xaxis",
+        "res_legs": "abs",
+        "res_scale_legs": 0.0,
+        "wm_joint_weights": "tracked",
+        "wm_joint_weight_clip": 4.0,
+        "wm_norm_eps": 0.001,
+        "rot_repr": "6d",
+        "robot": "evt",
+        "action_delay": true,
+        "delay_legs": "0,4",
+        "delay_feet": "0,4",
+        "delay_waist": "0,4",
+        "delay_arms": "0,4",
+        "delay_eval": "max"
+      },
+      "components": {
+        "wm": {
+          "parameters": 9234502,
+          "shapes": {
+            "net.0.weight": [
+              2048,
+              340
+            ],
+            "net.0.bias": [
+              2048
+            ],
+            "net.2.weight": [
+              2048,
+              2048
+            ],
+            "net.2.bias": [
+              2048
+            ],
+            "net.4.weight": [
+              2048,
+              2048
+            ],
+            "net.4.bias": [
+              2048
+            ],
+            "net.6.weight": [
+              70,
+              2048
+            ],
+            "net.6.bias": [
+              70
+            ]
+          }
+        },
+        "policy": {
+          "parameters": 9116477,
+          "shapes": {
+            "encoder.0.weight": [
+              2048,
+              730
+            ],
+            "encoder.0.bias": [
+              2048
+            ],
+            "encoder.2.weight": [
+              1024,
+              2048
+            ],
+            "encoder.2.bias": [
+              1024
+            ],
+            "encoder.4.weight": [
+              512,
+              1024
+            ],
+            "encoder.4.bias": [
+              512
+            ],
+            "encoder.6.weight": [
+              256,
+              512
+            ],
+            "encoder.6.bias": [
+              256
+            ],
+            "encoder.8.weight": [
+              32,
+              256
+            ],
+            "encoder.8.bias": [
+              32
+            ],
+            "decoder.0.weight": [
+              2048,
+              1022
+            ],
+            "decoder.0.bias": [
+              2048
+            ],
+            "decoder.2.weight": [
+              1024,
+              2048
+            ],
+            "decoder.2.bias": [
+              1024
+            ],
+            "decoder.4.weight": [
+              512,
+              1024
+            ],
+            "decoder.4.bias": [
+              512
+            ],
+            "decoder.6.weight": [
+              256,
+              512
+            ],
+            "decoder.6.bias": [
+              256
+            ],
+            "decoder.8.weight": [
+              29,
+              256
+            ],
+            "decoder.8.bias": [
+              29
+            ]
+          }
+        },
+        "critic": {
+          "parameters": 323073,
+          "shapes": {
+            "net.0.weight": [
+              256,
+              1132
+            ],
+            "net.0.bias": [
+              256
+            ],
+            "net.2.weight": [
+              128,
+              256
+            ],
+            "net.2.bias": [
+              128
+            ],
+            "net.4.weight": [
+              1,
+              128
+            ],
+            "net.4.bias": [
+              1
+            ]
+          }
+        }
+      },
+      "parameters_total": 18674052,
+      "physics_summary": {
+        "model": "evt2_simple",
+        "actuation": "torque_pd",
+        "physics_dt_s": 0.005,
+        "control_dt_s": 0.02,
+        "decimation": 4,
+        "robot_bodies": 30,
+        "robot_mass_kg": 63.272147999999994
+      }
+    },
+    {
+      "path": "/mnt/dataset/lqi3lr/dyh/allmimic/runs/evt2_simple_action_delay_seed_lafan_filter/last.pt",
+      "iteration": 192000,
+      "cfg": {
+        "motions": "data/processed/evt_seed_lafan_train_flat_v1_grounded_filtered.npz",
+        "clip_prefixes": "",
+        "clip_list": "",
+        "softmax_cap": 50.0,
+        "out": "runs/evt2_simple_action_delay_seed_lafan_filter",
+        "seed": 0,
+        "num_envs": 4096,
+        "buffer_steps": 1000,
+        "iterations": 320000,
+        "utd": 0.4,
+        "warmup_steps": 64,
+        "k": 8,
+        "wm_batch": 2048,
+        "wm_batches": 10,
+        "horizon": 32,
+        "pi_batch": 4096,
+        "gamma": 0.99,
+        "lam": 0.95,
+        "lr": 0.0004,
+        "lr_final_frac": 0.03,
+        "lr_decay_iters": 250000,
+        "critic_epochs": 5,
+        "critic_minibatches": 4,
+        "action_noise": 0.1,
+        "collect_det_frac": 0.25,
+        "img_action_noise": 0.0,
+        "pi_clip": 0.03125,
+        "critic_heads": 1,
+        "value_clip": true,
+        "wm_rot_out": "axis",
+        "clean_prev_action": false,
+        "w_residual": 0.0,
+        "retire_g": 0.0,
+        "bptt_detach": 0,
+        "gap_every": 0,
+        "gap_envs": 256,
+        "bin_prior": "",
+        "bin_prior_alpha": 0.3,
+        "optimizer": "adam",
+        "use_critic": true,
+        "log_every": 100,
+        "ckpt_every": 4000,
+        "eval_every": 4000,
+        "eval_clips": 0,
+        "eval_envs": 4096,
+        "wall_hours": 1000000000.0,
+        "tf32": true,
+        "amp": true,
+        "compile_wm": true,
+        "wm_compile_mode": "reduce-overhead",
+        "lr_sqrt_world": true,
+        "norm_update_every": 5,
+        "resume": "",
+        "goal_pos": "current_ref",
+        "goal_rot": "current_ref",
+        "critic_future_root": true,
+        "actor_ref_orientation": true,
+        "noise_ref_orientation": 0.05,
+        "goal_pos_noise": 0.0,
+        "action": "res",
+        "res_scale": 1.0,
+        "future_offsets": "",
+        "latent": 128,
+        "compile_bptt": "reduce-overhead",
+        "bptt_checkpoint": 0,
+        "heading": "xaxis",
+        "res_legs": "abs",
+        "res_scale_legs": 0.0,
+        "wm_joint_weights": "tracked",
+        "wm_joint_weight_clip": 4.0,
+        "wm_norm_eps": 0.001,
+        "rot_repr": "6d",
+        "robot": "evt",
+        "action_delay": true,
+        "delay_legs": "0,4",
+        "delay_feet": "0,4",
+        "delay_waist": "0,4",
+        "delay_arms": "0,4",
+        "delay_eval": "max"
+      },
+      "components": {
+        "wm": {
+          "parameters": 9234502,
+          "shapes": {
+            "net.0.weight": [
+              2048,
+              340
+            ],
+            "net.0.bias": [
+              2048
+            ],
+            "net.2.weight": [
+              2048,
+              2048
+            ],
+            "net.2.bias": [
+              2048
+            ],
+            "net.4.weight": [
+              2048,
+              2048
+            ],
+            "net.4.bias": [
+              2048
+            ],
+            "net.6.weight": [
+              70,
+              2048
+            ],
+            "net.6.bias": [
+              70
+            ]
+          }
+        },
+        "policy": {
+          "parameters": 9337757,
+          "shapes": {
+            "encoder.0.weight": [
+              2048,
+              730
+            ],
+            "encoder.0.bias": [
+              2048
+            ],
+            "encoder.2.weight": [
+              1024,
+              2048
+            ],
+            "encoder.2.bias": [
+              1024
+            ],
+            "encoder.4.weight": [
+              512,
+              1024
+            ],
+            "encoder.4.bias": [
+              512
+            ],
+            "encoder.6.weight": [
+              256,
+              512
+            ],
+            "encoder.6.bias": [
+              256
+            ],
+            "encoder.8.weight": [
+              128,
+              256
+            ],
+            "encoder.8.bias": [
+              128
+            ],
+            "decoder.0.weight": [
+              2048,
+              1118
+            ],
+            "decoder.0.bias": [
+              2048
+            ],
+            "decoder.2.weight": [
+              1024,
+              2048
+            ],
+            "decoder.2.bias": [
+              1024
+            ],
+            "decoder.4.weight": [
+              512,
+              1024
+            ],
+            "decoder.4.bias": [
+              512
+            ],
+            "decoder.6.weight": [
+              256,
+              512
+            ],
+            "decoder.6.bias": [
+              256
+            ],
+            "decoder.8.weight": [
+              29,
+              256
+            ],
+            "decoder.8.bias": [
+              29
+            ]
+          }
+        },
+        "critic": {
+          "parameters": 323073,
+          "shapes": {
+            "net.0.weight": [
+              256,
+              1132
+            ],
+            "net.0.bias": [
+              256
+            ],
+            "net.2.weight": [
+              128,
+              256
+            ],
+            "net.2.bias": [
+              128
+            ],
+            "net.4.weight": [
+              1,
+              128
+            ],
+            "net.4.bias": [
+              1
+            ]
+          }
+        }
+      },
+      "parameters_total": 18895332,
+      "physics_summary": {
+        "model": "evt2_simple",
+        "actuation": "torque_pd",
+        "physics_dt_s": 0.005,
+        "control_dt_s": 0.02,
+        "decimation": 4,
+        "robot_bodies": 30,
+        "robot_mass_kg": 63.272147999999994
+      }
+    }
+  ],
+  "audit_date": "2026-11-11",
+  "source_revisions": {
+    "supermimic": "5efbf114e11f725c31d83e217be987c13c0e4ce2",
+    "allmimic": "01e6ad299e7db753a7822551dbd58c00548a8c30"
+  },
+  "supermimic_assumptions": {
+    "joints": 29,
+    "base_context_dim": 33,
+    "maxcoord_tracked_bodies": 14,
+    "motion_goal_dim": 640,
+    "critic_goal_dim": 670,
+    "research_dependency_available": false
+  },
+  "audit_runtime": "allmimic/.venv: Python 3.11, PyTorch 2.14.1+cu130; network-only meta construction, no full SuperMimic import or training"
+}
