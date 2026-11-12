@@ -20,6 +20,7 @@ from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
 from supermimic.robots.control import restore_control
+from supermimic.runners.policy_export import export_policy_checkpoint
 from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
 from supermimic.runners.supermimic_runner import build_actor, build_world_model
 from supermimic.scripts.video_recorder import PlaybackVideoRecorder, video_frame_count
@@ -40,6 +41,13 @@ PLAY_FLAGS = tuple(f for f in mjlab.TYRO_FLAGS if f is not tyro.conf.FlagConvers
 @dataclass
 class PlayConfig:
   wandb_path: str
+  export_onnx: bool = False
+  """Export a policy without embedded motion before playback."""
+  export_only: bool = False
+  """Export and exit without loading motions or creating a simulation/viewer."""
+  export_dir: Path | None = None
+  """Default: exports/<task_id>/<run_id>."""
+  export_task: Literal["motion", "velocity", "all"] = "motion"
   motion_file: str | None = None
   initial_task: Literal["motion", "velocity"] = "motion"
   """Task selected when the viewer opens. Switch live via the GUI dropdown."""
@@ -59,8 +67,10 @@ class PlayConfig:
   """Clip reset position. Video defaults to start; regular play keeps its behavior."""
 
   def __post_init__(self) -> None:
-    if self.viewer == "none" and not self.video:
-      raise ValueError("--viewer none requires --video")
+    if self.viewer == "none" and not self.video and not self.export_only:
+      raise ValueError("--viewer none requires --video or --export-only")
+    if self.export_only and self.video:
+      raise ValueError("--export-only cannot be combined with --video")
     if self.video:
       video_frame_count(self.video_duration, 1.0)
       if (
@@ -76,7 +86,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
-  print(f"[INFO] Loading environment: {task_id}")
+  print(f"[INFO] Loading task configuration: {task_id}")
   env_cfg = load_env_cfg(task_id, play=True)
   env_cfg.scene.num_envs = 1
   env_cfg.observations["actor"].enable_corruption = True
@@ -88,7 +98,31 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   runner_cfg = load_runner_cfg(run.config)
   check_representation_matches(task_id, runner_cfg.representation)
   model_dir = download_model_dir(run)
-  bundle = torch.load(model_dir / "world_model.pt", map_location=device)
+  bundle = torch.load(
+    model_dir / "world_model.pt",
+    map_location="cpu" if cfg.export_only else device,
+    weights_only=True,
+  )
+  if cfg.export_onnx or cfg.export_only:
+    motion_cfg = env_cfg.commands["motion"]
+    saved_motion = run.config.get("env_cfg", {}).get("commands", {}).get("motion", {})
+    paths = export_policy_checkpoint(
+      torch.load(model_dir / "actor.pt", map_location="cpu", weights_only=True),
+      runner_cfg,
+      bundle.get("robot_control"),
+      task_id=task_id,
+      body_names=list(saved_motion.get("body_names", motion_cfg.body_names)),
+      anchor_body_name=saved_motion.get(
+        "anchor_body_name", motion_cfg.anchor_body_name
+      ),
+      path=cfg.export_dir or Path("exports") / task_id / run.id,
+      run_path=cfg.wandb_path,
+      task=cfg.export_task,
+    )
+    for path in paths:
+      print(f"[INFO] Exported: {path}")
+    if cfg.export_only:
+      return
   restore_control(env_cfg, bundle.get("robot_control"))
 
   motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]

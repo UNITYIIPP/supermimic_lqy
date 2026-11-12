@@ -18,3 +18,10 @@ uv run src/supermimic/scripts/play.py \
   --video \
   --video-duration 30 \
   --video-dir videos/play
+
+#export
+uv run src/supermimic/scripts/play.py \
+  SuperMimic-GenCoord-EVT \
+  --wandb-path '244033717-huazhong-university-of-science-and-technology/supermimic/6ja94e4t' \
+  --export-only \
+  --export-dir exports/evt_6ja94e4t

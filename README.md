@@ -112,6 +112,53 @@ uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-EVT \
   --wandb-path <RUN_PATH> --motion-file data/evt/walk1_subject1.npz
 ```
 
+## Exporting ONNX without motion data
+
+Export the saved EVT policy without loading any NPZ files or starting a simulator:
+
+```bash
+uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-EVT \
+  --wandb-path <RUN_PATH> --export-only --export-dir exports/evt
+```
+
+This writes `policy_motion.onnx` and `policy_motion.json`. Without `--export-dir`,
+the output directory is `exports/<TASK_ID>/<RUN_ID>`. The checkpoint and runner
+configuration are fetched from W&B, using the existing artifact cache. No motion
+artifact is downloaded. This mode has no 15,000-frame limit, works on CPU, and
+supports both `proprio` and `rep_state` policies with their original input layouts.
+Use `--export-onnx` instead of `--export-only` to export and then continue normal
+playback (playback still requires reference motions).
+
+The ONNX has two **float32** inputs and one output, with batch size fixed at 1:
+
+- `history`: `[1, history_length, obs_dim]`, oldest frame first, newest last.
+  Supply unnormalized observations; normalization is included in the graph.
+- `goal`: `[1, goal_dim]`, the externally supplied task target.
+- `actions`: `[1, num_joints]`, raw policy actions. Convert them with
+  `joint_target = action_offset + action_scale * actions`.
+
+For EVT with history length 1, `proprio` history is `[1, 1, 93]`; GenCoord
+`rep_state` history is `[1, 1, 68]`. Motion goals are `[1, 640]`: ten frames of
+`[joint_pos(29), joint_vel(29)]`, followed by ten relative anchor orientations
+(rot6d). Frames are spaced five control steps apart. The JSON sidecar and the
+ONNX `policy_contract` metadata document the precise layout, joint/body order,
+input shapes and action mapping. Unlike the training-time motion export, this
+graph has no `time_step` input or embedded reference-motion outputs. Deployment
+must construct the goal each step; this is not an autonomous motion generator.
+A `rep_state` policy still needs the corresponding root/body state estimates.
+
+Both files contain the **checkpoint's** PD gains, action scales, offsets, initial
+joint positions, torque/nominal velocity limits, control period, delay settings,
+and complete `robot_control` snapshot at full precision. Later changes to
+`robots/evt.py` do not silently replace these saved settings. Old checkpoints
+without `robot_control` (including existing G1 checkpoints) fail explicitly;
+the exporter does not guess their training control parameters.
+
+`--export-task velocity` exports `policy_velocity.onnx` with a 3D
+`[vx_b, vy_b, wz_b]` goal; `--export-task all` exports both encoders. The default
+is `motion`. A warning is emitted if the selected encoder had zero training
+slots, since the presence of encoder weights does not establish that it was trained.
+
 ## Recording playback
 
 Add `--video` to record an MP4 while using Viser or the native viewer:

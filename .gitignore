@@ -231,6 +231,7 @@ video/
 videos/
 checkpoints/
 outputs/
+exports/
 runs/
 *.pt
 *.pth
