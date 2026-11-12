@@ -178,59 +178,63 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
       self.alg.actor.update_normalization(actor_td)
 
   def run(self) -> None:
-    log_dir = self._create_log_dir("ppo")
-    self._init_wandb(log_dir, name_suffix="-ppo")
-    self._seed_sim_history()
+    try:
+      log_dir = self._create_log_dir("ppo")
+      self._init_logging(log_dir, name_suffix="-ppo")
+      self._seed_sim_history()
 
-    print(f"[INFO] Starting MBPO training loop for {self.cfg.max_iterations} iters...")
-
-    for iteration in range(self.cfg.max_iterations):
-      start_time = time.time()
-
-      num_collected_steps = self.collect_data()
-      collect_time = time.time() - start_time
-
-      if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
-        print("[WARN] Insufficient data. Skipping world model and policy update.")
-        continue
-
-      start_wm_time = time.time()
-      data = (
-        self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
-        for _ in range(self.cfg.wm.num_batches)
+      print(
+        f"[INFO] Starting MBPO training loop for {self.cfg.max_iterations} iters..."
       )
-      wm_logs = self.world_model_learner.update(data)
-      wm_learn_time = time.time() - start_wm_time
 
-      start_policy_time = time.time()
-      ppo_logs = {f"Policy/{k}": v for k, v in self.imagine().items()}
-      policy_learn_time = time.time() - start_policy_time
+      for iteration in range(self.cfg.max_iterations):
+        start_time = time.time()
 
-      if iteration % self.cfg.log_interval == 0:
-        self.logger.log(
-          it=iteration,
-          total_it=self.cfg.max_iterations,
-          collect_time=collect_time,
-          wm_learn_time=wm_learn_time,
-          policy_learn_time=policy_learn_time,
-          loss_dict={**wm_logs, **ppo_logs},
-          num_collected_steps=num_collected_steps,
+        num_collected_steps = self.collect_data()
+        collect_time = time.time() - start_time
+
+        if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
+          print("[WARN] Insufficient data. Skipping world model and policy update.")
+          continue
+
+        start_wm_time = time.time()
+        data = (
+          self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
+          for _ in range(self.cfg.wm.num_batches)
         )
+        wm_logs = self.world_model_learner.update(data)
+        wm_learn_time = time.time() - start_wm_time
 
-      if (iteration + 1) % self.cfg.save_interval == 0:
-        world_model_path = str(log_dir / "world_model.pt")
-        actor_path = str(log_dir / "actor.pt")
-        torch.save(self._wm.bundle(), world_model_path)
-        torch.save(
-          {
-            "actor": self.alg.actor.state_dict(),
-            "critic": self.alg.critic.state_dict(),
-          },
-          actor_path,
-        )
-        checkpoint_files = [world_model_path, actor_path]
-        if self._wm.robot_control:
-          checkpoint_files.append(str(log_dir / "robot_control.json"))
-        log_model_artifact(checkpoint_files)
+        start_policy_time = time.time()
+        ppo_logs = {f"Policy/{k}": v for k, v in self.imagine().items()}
+        policy_learn_time = time.time() - start_policy_time
 
-    self._cleanup()
+        if iteration % self.cfg.log_interval == 0:
+          self.logger.log(
+            it=iteration,
+            total_it=self.cfg.max_iterations,
+            collect_time=collect_time,
+            wm_learn_time=wm_learn_time,
+            policy_learn_time=policy_learn_time,
+            loss_dict={**wm_logs, **ppo_logs},
+            num_collected_steps=num_collected_steps,
+          )
+
+        if (iteration + 1) % self.cfg.save_interval == 0:
+          world_model_path = str(log_dir / "world_model.pt")
+          actor_path = str(log_dir / "actor.pt")
+          torch.save(self._wm.bundle(), world_model_path)
+          torch.save(
+            {
+              "actor": self.alg.actor.state_dict(),
+              "critic": self.alg.critic.state_dict(),
+            },
+            actor_path,
+          )
+          checkpoint_files = [world_model_path, actor_path]
+          if self._wm.robot_control:
+            checkpoint_files.append(str(log_dir / "robot_control.json"))
+          if self.cfg.wandb_enabled:
+            log_model_artifact(checkpoint_files)
+    finally:
+      self._cleanup()

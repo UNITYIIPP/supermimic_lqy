@@ -43,6 +43,35 @@ uv run src/supermimic/scripts/play.py \
   <TASK_ID> --wandb-path <RUN_PATH>
 ```
 
+## Training curves
+
+Training records scalar metrics to local TensorBoard by default. W&B recording
+is disabled (`BaseRunnerCfg.wandb_enabled = False`); add `--runner.wandb-enabled True`
+to enable W&B metrics and model uploads alongside local recording.
+Metric names, values, logging frequency, and steps match between both backends.
+This includes losses, policy statistics, real-environment rewards and episode
+statistics, and performance metrics. W&B's automatic system monitoring and model
+artifacts are separate from these scalar metrics.
+
+TensorBoard events and a `config.json` snapshot of the training configuration are
+saved alongside checkpoints in `logs/<TASK_ID>/<timestamp>/`. The PPO entry point
+uses `logs/<TASK_ID>/ppo/<timestamp>/`. Events flush every 30 seconds and on normal
+exit, Ctrl+C, or a Python exception. Existing runs are not backfilled.
+Local checkpoints and ONNX export still work with W&B recording disabled.
+Explicit remote inputs (`--registry-name` or `--runner.wandb-run-path`) still
+access W&B to download data/models; use `--motion-file` for local motion data.
+
+```bash
+uv run tensorboard --logdir logs --port 6006 --load_fast=false
+```
+
+Open `http://localhost:6006`; forward port 6006 when training on a remote machine.
+Use `--load_fast=false`: events preserve W&B's double-precision scalar values,
+which TensorBoard 2.20's experimental fast loader does not display.
+`--runner.log-interval` controls recording frequency for both backends. The main
+runner uses the log-record index as its step; the PPO runner uses the training
+iteration. Both match their existing W&B axes.
+
 ## EVT training
 
 EVT uses the sibling asset `../allmimic/assets/robots/evt/urdf/evt2_simple.xml`

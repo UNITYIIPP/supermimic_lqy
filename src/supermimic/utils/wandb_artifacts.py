@@ -70,7 +70,8 @@ def log_model_artifact(
   may repeat. Keeps the newest ``keep_last`` versions, every
   ``milestone_every``-th version, and any aliased version; deletes the rest.
   """
-  assert wandb.run is not None, "log_model_artifact needs an active wandb run"
+  if wandb.run is None or wandb.run.disabled:
+    return
   try:
     artifact = wandb.Artifact(f"model-{wandb.run.id}", type="model")
     for path in files:

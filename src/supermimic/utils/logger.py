@@ -3,14 +3,15 @@ from __future__ import annotations
 import statistics
 import time
 from collections import deque
+from pathlib import Path
 
 import torch
 import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 
 class Logger:
-  """Episode statistics of the real env, logged as one W&B row and one console
-  block per log call."""
+  """Shared training metrics for W&B, local TensorBoard, and the console."""
 
   def __init__(
     self,
@@ -18,11 +19,14 @@ class Logger:
     num_envs: int,
     max_episode_length: int,
     device: str,
+    wandb_enabled: bool = False,
   ) -> None:
     self.run_name = run_name
     self.num_envs = num_envs
     self.max_episode_length = max_episode_length
     self.device = device
+    self.wandb_enabled = wandb_enabled
+    self._writer: SummaryWriter | None = None
 
     self.tot_timesteps = 0
     self.tot_time = 0.0
@@ -37,6 +41,20 @@ class Logger:
     self.cur_episode_length = torch.zeros(
       self.num_envs, dtype=torch.float, device=self.device
     )
+
+  def init_tensorboard(self, log_dir: Path) -> None:
+    """Write events alongside this run's checkpoints, flushing every 30 seconds."""
+    self.close()
+    self._writer = SummaryWriter(log_dir=str(log_dir), flush_secs=30)
+
+  def close(self) -> None:
+    """Flush pending metrics and release the writer; safe to call repeatedly."""
+    writer, self._writer = self._writer, None
+    if writer is not None:
+      try:
+        writer.flush()
+      finally:
+        writer.close()
 
   def process_env_step(
     self,
@@ -177,7 +195,14 @@ class Logger:
       row["Train/mean_reward"] = statistics.mean(self.rewbuffer)
       row["Train/mean_episode_length"] = statistics.mean(self.lenbuffer)
     row |= {k if "/" in k else f"Episode/{k}": v for k, v in extras.items()}
-    wandb.log(row, step=it)
+    if self._writer is not None:
+      for name, value in row.items():
+        # Preserve Python-float precision; TB 2.20 needs --load_fast=false.
+        self._writer.add_scalar(
+          name, value, global_step=it, new_style=True, double_precision=True
+        )
+    if self.wandb_enabled:
+      wandb.log(row, step=it)
     print(
       self._build_console_log(
         it,

@@ -9,6 +9,13 @@ CUDA_VISIBLE_DEVICES=0 uv run src/supermimic/scripts/train.py \
   --runner.actor-obs proprio \
   --runner.run-name evt_multi_motion
 
+
+CUDA_VISIBLE_DEVICES=0 uv run src/supermimic/scripts/train.py \
+  SuperMimic-MaxCoord-EVT \
+  --motion-file 'data/evt/*.npz' \
+  --num-envs 4096
+
+
 #play
 uv run src/supermimic/scripts/play.py \
   SuperMimic-GenCoord-EVT \

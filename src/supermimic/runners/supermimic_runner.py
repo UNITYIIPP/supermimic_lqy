@@ -14,6 +14,7 @@ import tyro
 import wandb
 from rsl_rl.models import MLPModel
 from tensordict import TensorDict
+from wandb.util import json_friendly_val
 
 from supermimic.envs.motion_tracking_env import MotionTrackingEnv
 from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
@@ -48,13 +49,15 @@ from supermimic.utils.wandb_artifacts import download_model_dir, log_model_artif
 class BaseRunnerCfg:
   """Shared configuration fields for all runners."""
 
+  wandb_enabled: bool = False
+  """Record metrics and upload models to W&B in addition to local TensorBoard."""
   wandb_project: str = "supermimic"
   run_name: str | None = None
   wandb_run_path: str | None = None
   headless: bool = True
   buffer_size: int = 1000
   representation: str = "gencoord"  # "gencoord" or "maxcoord"
-  actor_obs: str = "rep_state"  # "rep_state" or "proprio"
+  actor_obs: str = "proprio"  # "rep_state" or "proprio"
   log_interval: int = 10
   save_interval: int = 1000
   history_length: int = 1
@@ -274,6 +277,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       num_envs=env.num_envs,
       max_episode_length=env.max_episode_length,
       device=device,
+      wandb_enabled=cfg.wandb_enabled,
     )
 
   def _init_common(self) -> None:
@@ -479,9 +483,14 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     print(f"[INFO] Logging to {log_dir}")
     return log_dir
 
-  def _init_wandb(self, log_dir: Path, name_suffix: str = "") -> None:
-    """Initialize the W&B run and link the registry artifacts."""
-    wandb_config = {
+  def _init_logging(self, log_dir: Path, name_suffix: str = "") -> None:
+    """Save local logs/config, optionally starting a W&B run for this training."""
+    self._wandb_run = None
+    self._run_name = self.cfg.run_name or (
+      f"{self.task_id}{name_suffix}-{log_dir.name}"
+    )
+    self.logger.init_tensorboard(log_dir)
+    run_config = {
       "env_cfg": asdict(self.env.cfg),
       "runner_cfg": asdict(self.cfg),
       "task_id": self.task_id,
@@ -492,12 +501,20 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
         json.dumps(self._wm.robot_control, indent=2) + "\n"
       )
 
-    default_name = f"{self.task_id}{name_suffix}-{log_dir.name}"
-    wandb.init(
-      project=self.cfg.wandb_project,
-      name=self.cfg.run_name or default_name,
-      config=wandb_config,
+    # Use the same value normalization as W&B without starting a W&B run.
+    (log_dir / "config.json").write_text(
+      json.dumps(json_friendly_val(run_config), indent=2) + "\n"
     )
+    if not self.cfg.wandb_enabled:
+      print("[INFO] W&B recording disabled; using local TensorBoard and checkpoints")
+      return
+
+    self._wandb_run = wandb.init(
+      project=self.cfg.wandb_project,
+      name=self._run_name,
+      config=run_config,
+    )
+    self._run_name = self._wandb_run.name
 
     if self.registry_name:
       api = wandb.Api()
@@ -507,14 +524,20 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
           name = name + ":latest"
         print(f"[INFO] Linking registry artifact: {name}")
         artifact = api.artifact(name)
-        wandb.run.use_artifact(artifact)
+        self._wandb_run.use_artifact(artifact)
 
   def _cleanup(self) -> None:
-    """Close environment and finish W&B run."""
-    env_close_fn = getattr(self.env, "close", None)
-    if env_close_fn:
-      env_close_fn()
-    wandb.finish()
+    """Flush local metrics, close the environment, and finish the W&B run."""
+    try:
+      self.logger.close()
+    finally:
+      try:
+        env_close_fn = getattr(self.env, "close", None)
+        if env_close_fn:
+          env_close_fn()
+      finally:
+        if getattr(self, "_wandb_run", None) is not None:
+          wandb.finish()
 
 
 class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
@@ -674,105 +697,107 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       self.policy_learner.actor.update_normalization(actor_td)
 
   def run(self) -> None:
-    log_dir = self._create_log_dir()
-    self._init_wandb(log_dir)
+    try:
+      log_dir = self._create_log_dir()
+      self._init_logging(log_dir)
 
-    self.env.reset()
-    self._seed_sim_history()
+      self.env.reset()
+      self._seed_sim_history()
 
-    print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
+      print(
+        f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations..."
+      )
 
-    should_train = Ratio(
-      self.env.num_envs
-      / self.cfg.wm.num_batches
-      / self.cfg.wm.batch_size
-      / self.cfg.wm.horizon
-      * self.cfg.replay_ratio
-    )
+      should_train = Ratio(
+        self.env.num_envs
+        / self.cfg.wm.num_batches
+        / self.cfg.wm.batch_size
+        / self.cfg.wm.horizon
+        * self.cfg.replay_ratio
+      )
 
-    num_collected_steps = 0
-    start_time = time.time()
-    wm_learn_time = 0.0
-    policy_learn_time = 0.0
-    loss_dict: dict[str, torch.Tensor] = {}
-    log_count = 0
-    uploader = ThreadPoolExecutor(max_workers=1)
-    upload: Future | None = None
+      num_collected_steps = 0
+      start_time = time.time()
+      wm_learn_time = 0.0
+      policy_learn_time = 0.0
+      loss_dict: dict[str, torch.Tensor] = {}
+      log_count = 0
+      with ThreadPoolExecutor(max_workers=1) as uploader:
+        upload: Future | None = None
 
-    for step in range(self.cfg.max_iterations):
-      num_collected_steps += self.step()
+        for step in range(self.cfg.max_iterations):
+          num_collected_steps += self.step()
 
-      for _ in range(should_train(step)):
-        if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
-          continue
+          for _ in range(should_train(step)):
+            if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
+              continue
 
-        data = (
-          self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
-          for _ in range(self.cfg.wm.num_batches)
-        )
+            data = (
+              self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
+              for _ in range(self.cfg.wm.num_batches)
+            )
 
-        start_wm_time = time.time()
-        wm_logs = self.world_model_learner.update(data)
-        wm_learn_time += time.time() - start_wm_time
+            start_wm_time = time.time()
+            wm_logs = self.world_model_learner.update(data)
+            wm_learn_time += time.time() - start_wm_time
 
-        start_policy_time = time.time()
-        policy_logs = self.policy_learner.update()
-        policy_learn_time += time.time() - start_policy_time
+            start_policy_time = time.time()
+            policy_logs = self.policy_learner.update()
+            policy_learn_time += time.time() - start_policy_time
 
-        loss_dict.update(wm_logs)
-        loss_dict.update(policy_logs)
+            loss_dict.update(wm_logs)
+            loss_dict.update(policy_logs)
 
-      if step % self.cfg.log_interval == 0:
-        elapsed_time = time.time() - start_time
-        total_train_time = wm_learn_time + policy_learn_time
-        collect_time = elapsed_time - total_train_time
+          if step % self.cfg.log_interval == 0:
+            elapsed_time = time.time() - start_time
+            total_train_time = wm_learn_time + policy_learn_time
+            collect_time = elapsed_time - total_train_time
 
-        self.logger.log(
-          it=log_count,
-          total_it=self.cfg.max_iterations // self.cfg.log_interval,
-          collect_time=collect_time,
-          wm_learn_time=wm_learn_time,
-          policy_learn_time=policy_learn_time,
-          loss_dict=loss_dict,
-          num_collected_steps=num_collected_steps,
-        )
+            self.logger.log(
+              it=log_count,
+              total_it=self.cfg.max_iterations // self.cfg.log_interval,
+              collect_time=collect_time,
+              wm_learn_time=wm_learn_time,
+              policy_learn_time=policy_learn_time,
+              loss_dict=loss_dict,
+              num_collected_steps=num_collected_steps,
+            )
 
-        log_count += 1
-        start_time = time.time()
-        wm_learn_time = 0
-        policy_learn_time = 0
-        num_collected_steps = 0
+            log_count += 1
+            start_time = time.time()
+            wm_learn_time = 0
+            policy_learn_time = 0
+            num_collected_steps = 0
 
-      if step % self.cfg.save_interval == 0:
-        assert wandb.run is not None  # _init_wandb ran before the loop
-        # The previous version must be logged before its files are overwritten.
-        if upload is not None:
-          upload.result()
-        world_model_path = str(log_dir / "world_model.pt")
-        actor_path = str(log_dir / "actor.pt")
-        torch.save(self._wm.bundle(), world_model_path)
-        torch.save(self.policy_learner.actor.state_dict(), actor_path)
-        checkpoint_files = [world_model_path, actor_path]
-        if self._wm.robot_control:
-          checkpoint_files.append(str(log_dir / "robot_control.json"))
-        critic = getattr(self.policy_learner, "critic", None)
-        if critic is not None:
-          critic_path = str(log_dir / "critic.pt")
-          torch.save(critic.state_dict(), critic_path)
-          checkpoint_files.append(critic_path)
-        # Skip ONNX export on huge datasets.
-        if (
-          self._representation.actor_obs_mode == "proprio"
-          and self.motion.time_step_total <= 15_000
-        ):
-          checkpoint_files += export_actor_as_onnx(
-            actor=self.policy_learner.actor,
-            env=self.env.unwrapped,
-            path=str(log_dir),
-            run_name=wandb.run.name,
-            term_widths=self._representation.proprio_term_widths(self._num_actions),
-          )
-        upload = uploader.submit(log_model_artifact, checkpoint_files)
-
-    uploader.shutdown()
-    self._cleanup()
+          if step % self.cfg.save_interval == 0:
+            # The previous version must be logged before its files are overwritten.
+            if upload is not None:
+              upload.result()
+            world_model_path = str(log_dir / "world_model.pt")
+            actor_path = str(log_dir / "actor.pt")
+            torch.save(self._wm.bundle(), world_model_path)
+            torch.save(self.policy_learner.actor.state_dict(), actor_path)
+            checkpoint_files = [world_model_path, actor_path]
+            if self._wm.robot_control:
+              checkpoint_files.append(str(log_dir / "robot_control.json"))
+            critic = getattr(self.policy_learner, "critic", None)
+            if critic is not None:
+              critic_path = str(log_dir / "critic.pt")
+              torch.save(critic.state_dict(), critic_path)
+              checkpoint_files.append(critic_path)
+            # Skip ONNX export on huge datasets.
+            if (
+              self._representation.actor_obs_mode == "proprio"
+              and self.motion.time_step_total <= 15_000
+            ):
+              checkpoint_files += export_actor_as_onnx(
+                actor=self.policy_learner.actor,
+                env=self.env.unwrapped,
+                path=str(log_dir),
+                run_name=self._run_name,
+                term_widths=self._representation.proprio_term_widths(self._num_actions),
+              )
+            if self.cfg.wandb_enabled:
+              upload = uploader.submit(log_model_artifact, checkpoint_files)
+    finally:
+      self._cleanup()
