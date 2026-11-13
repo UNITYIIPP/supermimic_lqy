@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,13 +41,15 @@ PLAY_FLAGS = tuple(f for f in mjlab.TYRO_FLAGS if f is not tyro.conf.FlagConvers
 
 @dataclass
 class PlayConfig:
-  wandb_path: str
+  wandb_path: str | None = None
+  checkpoint_dir: Path | None = None
+  """Local training directory containing config.json, actor.pt and world_model.pt."""
   export_onnx: bool = False
   """Export a policy without embedded motion before playback."""
   export_only: bool = False
   """Export and exit without loading motions or creating a simulation/viewer."""
   export_dir: Path | None = None
-  """Default: exports/<task_id>/<run_id>."""
+  """Default: <checkpoint_dir>/exports (W&B uses its downloaded model directory)."""
   export_task: Literal["motion", "velocity", "all"] = "motion"
   motion_file: str | None = None
   initial_task: Literal["motion", "velocity"] = "motion"
@@ -67,6 +70,8 @@ class PlayConfig:
   """Clip reset position. Video defaults to start; regular play keeps its behavior."""
 
   def __post_init__(self) -> None:
+    if (self.wandb_path is None) == (self.checkpoint_dir is None):
+      raise ValueError("Specify exactly one of --wandb-path or --checkpoint-dir")
     if self.viewer == "none" and not self.video and not self.export_only:
       raise ValueError("--viewer none requires --video or --export-only")
     if self.export_only and self.video:
@@ -91,13 +96,27 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   env_cfg.scene.num_envs = 1
   env_cfg.observations["actor"].enable_corruption = True
 
-  import wandb
+  run = None
+  if cfg.checkpoint_dir is not None:
+    model_dir = cfg.checkpoint_dir.expanduser().resolve()
+    for name in ("config.json", "actor.pt", "world_model.pt"):
+      if not (model_dir / name).is_file():
+        raise FileNotFoundError(f"Missing local checkpoint file: {model_dir / name}")
+    print(f"[INFO] Loading local checkpoint: {model_dir}")
+    run_config = json.loads((model_dir / "config.json").read_text())
+    run_id = model_dir.name
+    run_path = str(model_dir)
+  else:
+    import wandb
 
-  print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
-  run = wandb.Api().run(cfg.wandb_path)
-  runner_cfg = load_runner_cfg(run.config)
+    print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
+    run = wandb.Api().run(cfg.wandb_path)
+    run_config = run.config
+    model_dir = download_model_dir(run)
+    run_id = run.id
+    run_path = cfg.wandb_path
+  runner_cfg = load_runner_cfg(run_config)
   check_representation_matches(task_id, runner_cfg.representation)
-  model_dir = download_model_dir(run)
   bundle = torch.load(
     model_dir / "world_model.pt",
     map_location="cpu" if cfg.export_only else device,
@@ -105,7 +124,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   )
   if cfg.export_onnx or cfg.export_only:
     motion_cfg = env_cfg.commands["motion"]
-    saved_motion = run.config.get("env_cfg", {}).get("commands", {}).get("motion", {})
+    saved_motion = run_config.get("env_cfg", {}).get("commands", {}).get("motion", {})
     paths = export_policy_checkpoint(
       torch.load(model_dir / "actor.pt", map_location="cpu", weights_only=True),
       runner_cfg,
@@ -115,8 +134,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       anchor_body_name=saved_motion.get(
         "anchor_body_name", motion_cfg.anchor_body_name
       ),
-      path=cfg.export_dir or Path("exports") / task_id / run.id,
-      run_path=cfg.wandb_path,
+      path=cfg.export_dir or model_dir / "exports",
+      run_path=run_path,
       task=cfg.export_task,
     )
     for path in paths:
@@ -125,7 +144,9 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       return
   restore_control(env_cfg, bundle.get("robot_control"))
 
-  motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
+  motion_artifacts = (
+    [a for a in run.used_artifacts() if a.type == "motions"] if run is not None else []
+  )
   command_term = env_cfg.commands["motion"]
   assert isinstance(command_term, MotionCommandCfg)
   motion_names: list[str] = []
@@ -150,6 +171,10 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     )
     motion_names = [a.name.split(":")[0] for a in motion_artifacts]
     print(f"[INFO] Loaded {len(motion_files)} motion(s)")
+  elif run is None:
+    saved_motion = run_config.get("env_cfg", {}).get("commands", {}).get("motion", {})
+    if saved_motion.get("motion_file"):
+      command_term.motion_file = saved_motion["motion_file"]
 
   env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg=env_cfg, device=device))
   recorder = None
@@ -192,7 +217,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
 
     if cfg.video:
       timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
-      path = cfg.video_dir / f"{task_id}_{run.id}_{timestamp}.mp4"
+      path = cfg.video_dir / f"{task_id}_{run_id}_{timestamp}.mp4"
       recorder = PlaybackVideoRecorder(
         env.unwrapped,
         path,

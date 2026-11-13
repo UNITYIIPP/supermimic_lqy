@@ -43,6 +43,20 @@ uv run src/supermimic/scripts/play.py \
   <TASK_ID> --wandb-path <RUN_PATH>
 ```
 
+For a local TensorBoard training run, load its checkpoint directory:
+
+```bash
+uv run src/supermimic/scripts/play.py \
+  SuperMimic-MaxCoord-EVT \
+  --checkpoint-dir logs/SuperMimic-MaxCoord-EVT/<TIMESTAMP> \
+  --motion-file data/evt/walk1_subject1.npz --viewer viser
+```
+
+The directory must contain `config.json`, `actor.pt`, and `world_model.pt`.
+Use the same task ID as training. Omit `--motion-file` to use the motion paths
+saved in the training configuration (relative paths resolve from the current
+working directory). Choose either `--checkpoint-dir` or `--wandb-path`.
+
 ## Training curves
 
 Training records scalar metrics to local TensorBoard by default. W&B recording
@@ -146,14 +160,17 @@ uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-EVT \
 Export the saved EVT policy without loading any NPZ files or starting a simulator:
 
 ```bash
-uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-EVT \
-  --wandb-path <RUN_PATH> --export-only --export-dir exports/evt
+uv run src/supermimic/scripts/play.py SuperMimic-MaxCoord-EVT \
+  --checkpoint-dir logs/SuperMimic-MaxCoord-EVT/<TIMESTAMP> --export-only
 ```
 
-This writes `policy_motion.onnx` and `policy_motion.json`. Without `--export-dir`,
-the output directory is `exports/<TASK_ID>/<RUN_ID>`. The checkpoint and runner
-configuration are fetched from W&B, using the existing artifact cache. No motion
-artifact is downloaded. This mode has no 15,000-frame limit, works on CPU, and
+This writes `policy_motion.onnx` and `policy_motion.json` into an automatically
+created `exports/` folder inside the checkpoint directory. Use `--export-dir`
+to choose a different output directory. With `--wandb-path <RUN_PATH>`, the
+checkpoint and runner configuration are fetched from W&B using the existing
+artifact cache, and the default output is the downloaded model directory's
+`exports/` folder. No motion artifact is downloaded.
+This mode has no 15,000-frame limit, works on CPU, and
 supports both `proprio` and `rep_state` policies with their original input layouts.
 Use `--export-onnx` instead of `--export-only` to export and then continue normal
 playback (playback still requires reference motions).
