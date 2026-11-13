@@ -3,11 +3,49 @@
 from __future__ import annotations
 
 import functools
+import time
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import contextmanager
+from typing import Literal
 
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
+
+from supermimic.utils.distributed import GradientReducer, world_size
+
+Execution = Literal["auto", "eager", "split", "full"]
+
+
+def resolve_execution(mode: Execution, profile: bool = False) -> Execution:
+  if mode == "auto":
+    return "split" if world_size() > 1 or profile else "full"
+  if mode == "full" and (world_size() > 1 or profile):
+    raise ValueError("full graphs require one GPU and profile=False; use split")
+  return mode
+
+
+class Timings:
+  def __init__(self, enabled: bool, device: str):
+    self.enabled, self.device = enabled, torch.device(device)
+    self.values: dict[str, float] = {}
+
+  @contextmanager
+  def measure(self, name: str):
+    if not self.enabled:
+      yield
+      return
+    if self.device.type == "cuda":
+      torch.cuda.synchronize(self.device)
+    start = time.perf_counter()
+    yield
+    if self.device.type == "cuda":
+      torch.cuda.synchronize(self.device)
+    self.values[name] = self.values.get(name, 0.0) + time.perf_counter() - start
+
+  def drain(self) -> dict[str, float]:
+    values, self.values = self.values, {}
+    return values
 
 
 def build_optimizers(
@@ -88,9 +126,10 @@ class CapturedUpdate:
   a CUDA graph and replays it on the device of ``state()``. ``fn`` must be
   capture-safe: no host syncs, fixed shapes, and every tensor it reads besides
   its inputs updated in place. Python values it reads are fixed at capture, and
-  each replay overwrites the outputs it returns. All CapturedUpdates on a device
-  record on one stream into one memory pool and must replay in the order they
-  were recorded. A replay raises if a tensor in ``state()`` moved; a learning rate
+  each replay overwrites the outputs it returns. By default, CapturedUpdates on
+  a device share one pool and must replay in their recording order; private_pool
+  gives each update an independent pool. A replay raises if a tensor in
+  ``state()`` moved; a learning rate
   that changes is a device tensor, changed in place with ``group["lr"].fill_(lr)``."""
 
   def __init__(
@@ -98,6 +137,7 @@ class CapturedUpdate:
     fn: Callable[[TensorDict], dict[str, torch.Tensor]],
     state: Callable[[], list[torch.Tensor]],
     warmup: int = 3,
+    private_pool: bool = False,
   ):
     self._fn = fn
     self._state = state
@@ -106,6 +146,10 @@ class CapturedUpdate:
     self._graph: torch.cuda.CUDAGraph | None = None
     self._identity: list[int] = []
     self._outputs: dict[str, torch.Tensor] = {}
+    # Split graphs can replay in arbitrary minibatch order. Their outputs may
+    # remain live while a different learner executes, so they cannot share pools.
+    self._private_pool = private_pool
+    self._pool = None
 
   def __call__(self, inputs: TensorDict) -> dict[str, torch.Tensor]:
     state = self._state()
@@ -113,6 +157,10 @@ class CapturedUpdate:
       return self._fn(inputs)
     with torch.cuda.device(state[0].device):
       stream, pool = _capture_stream_and_pool(state[0].device)
+      if self._private_pool:
+        if self._pool is None:
+          self._pool = torch.cuda.graph_pool_handle()
+        pool = self._pool
       if self._inputs is None:
         self._inputs = inputs.clone()
       else:
@@ -132,5 +180,78 @@ class CapturedUpdate:
       elif _identity(state) != self._identity:
         raise RuntimeError("a captured tensor moved")
       self._graph.replay()
-      torch.cuda.current_stream().synchronize()
+      if not self._private_pool:
+        torch.cuda.current_stream().synchronize()
       return self._outputs
+
+
+class GradientStep:
+  """Forward/backward graph -> external reduction -> clip/optimizer graph.
+
+  A separate instance per optimizer preserves graph gradient storage. Optimizer
+  steps use a separate graph (fused Adam / Muon); no NCCL operations are captured.
+  """
+
+  def __init__(
+    self,
+    loss_fn: Callable[[TensorDict], tuple[torch.Tensor, dict[str, torch.Tensor]]],
+    modules: Sequence[nn.Module],
+    optimizers: Sequence[torch.optim.Optimizer],
+    execution: str,
+    clip_value: float = 0.0,
+  ):
+    self.loss_fn, self.modules = loss_fn, modules
+    self.optimizers = optimizers
+    self.params = [
+      p for opt in optimizers for g in opt.param_groups for p in g["params"]
+    ]
+    self.reducer = GradientReducer(self.params)
+    self.clip_value = clip_value
+    self.execution = execution
+    self.captured = CapturedUpdate(
+      self._backward, lambda: graph_state(self.modules, []), private_pool=True
+    )
+    self._empty = TensorDict({}, batch_size=[])
+    self._captured_optimizer = CapturedUpdate(
+      self._finish,
+      lambda: [
+        *self.params,
+        *[p.grad for p in self.params if p.grad is not None],
+        *graph_state([], self.optimizers),
+      ],
+      private_pool=True,
+    )
+
+  def _backward(self, inputs: TensorDict) -> dict[str, torch.Tensor]:
+    for opt in self.optimizers:
+      opt.zero_grad(set_to_none=True)
+    loss, outputs = self.loss_fn(inputs)
+    loss.backward()
+    return {k: v.detach() for k, v in outputs.items()}
+
+  def __call__(self, inputs: TensorDict) -> dict[str, torch.Tensor]:
+    outputs = (
+      self.captured(inputs) if self.execution == "split" else self._backward(inputs)
+    )
+    # A captured backward has no Python zero_grad on replay. Clear gradients
+    # synthesized by the reducer for parameters unused on this rank.
+    if self.execution == "split" and self.reducer._local_presence is not None:
+      for p, local in zip(self.params, self.reducer._local_presence, strict=True):
+        if not local:
+          p.grad = None
+    self.reducer()
+    result = (
+      self._captured_optimizer(self._empty)
+      if self.execution == "split"
+      else self._finish(self._empty)
+    )
+    return {**outputs, **result}
+
+  def _finish(self, inputs: TensorDict) -> dict[str, torch.Tensor]:
+    del inputs
+    norm = torch.nn.utils.clip_grad_norm_(self.params, 1.0)
+    if self.clip_value > 0:
+      torch.nn.utils.clip_grad_value_(self.params, self.clip_value)
+    for opt in self.optimizers:
+      opt.step()
+    return {"grad_norm": norm.detach()}

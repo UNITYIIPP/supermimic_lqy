@@ -68,9 +68,8 @@ uv run tensorboard --logdir logs --port 6006 --load_fast=false
 Open `http://localhost:6006`; forward port 6006 when training on a remote machine.
 Use `--load_fast=false`: events preserve W&B's double-precision scalar values,
 which TensorBoard 2.20's experimental fast loader does not display.
-`--runner.log-interval` controls recording frequency for both backends. The main
-runner uses the log-record index as its step; the PPO runner uses the training
-iteration. Both match their existing W&B axes.
+`--runner.log-interval` controls recording frequency for both backends. Both
+runners use the completed training iteration as the TensorBoard and W&B step.
 
 ## EVT training
 
@@ -249,3 +248,10 @@ SuperMimic contains code inspired by these projects:
 Copyright 2026 The SuperMimic Authors.
 
 Released under the [Apache License 2.0](LICENSE).
+
+## Multi-GPU training
+
+Single-node `torchrun` training, profiling, checkpoint resume and local evaluation
+are documented in [docs/distributed_training.md](docs/distributed_training.md).
+Environment counts and learner batch sizes are **per rank**; divide all three by
+GPU count to preserve the single-GPU global workload.

@@ -41,6 +41,10 @@ class TrainConfig:
 
 
 def main() -> None:
+  if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+    raise ValueError(
+      "Multi-GPU is supported by supermimic.scripts.train; PPO is not yet distributed"
+    )
   all_tasks = list_tasks()
   chosen_task, remaining_args = tyro.cli(
     tyro.extras.literal_type_from_choices(all_tasks),

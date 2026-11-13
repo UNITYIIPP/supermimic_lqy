@@ -4,16 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from tensordict import TensorDict
 
 from supermimic.learners.learner_utils import (
   CapturedUpdate,
+  Execution,
+  GradientStep,
   _optimize_step,
   build_optimizers,
   graph_state,
+  resolve_execution,
 )
 
 if TYPE_CHECKING:
@@ -52,11 +55,13 @@ class WorldModelLearner:
     representation: StateRepresentation,
     cfg: WorldModelLearnerCfg,
     device: str = "cpu",
+    execution: Execution = "auto",
   ) -> None:
     self.dynamics = dynamics
     self.representation = representation
     self.cfg = cfg
     self.device = device
+    self.execution = resolve_execution(execution)
 
     self._all_params = list(dynamics.parameters())
     self.optimizers = build_optimizers([dynamics], self.cfg.lr, device=self.device)
@@ -70,6 +75,9 @@ class WorldModelLearner:
     self._compiled_rollout = torch.compile(self._rollout)
     self._compiled_compute_losses = torch.compile(self._compute_losses)
     self._compiled_represent = torch.compile(self.representation.represent)
+    self._gradient_step = GradientStep(
+      self._loss_from, [dynamics, representation], self.optimizers, self.execution
+    )
     self._captured_update = CapturedUpdate(
       self._update_from,
       lambda: graph_state([dynamics, representation], self.optimizers),
@@ -102,45 +110,56 @@ class WorldModelLearner:
     self.dynamics.train()
     for p in self._all_params:
       p.requires_grad_(True)
-    batches = torch.stack([td.select("state", "action", "sim_ctx") for td in data])
-    return self._captured_update(batches)
+    batches = cast(
+      TensorDict,
+      TensorDict.stack([td.select("state", "action", "sim_ctx") for td in data]),
+    )
+    if self.execution == "full":
+      return self._captured_update(batches)
+    return self._update_from(batches)
 
   def _update_from(self, batches: TensorDict) -> dict[str, torch.Tensor]:
     stats = []
 
     for td in batches.unbind(0):
-      full_states = td["state"]
-      actions = td["action"]
-
-      all_rep_states = self._compiled_represent(full_states)
-
-      all_aux_states = self.representation.extract_aux_state(full_states)
-      init_rep_state = all_rep_states[:, 0, :]
-      init_aux = all_aux_states[:, 0, :]
-
-      sim_ctx = td["sim_ctx"][:, 0]
-
-      pred_rep_states, pred_aux_states = self._compiled_rollout(
-        init_rep_state, actions, init_aux, sim_ctx
-      )
-
-      # 2. Vectorized Loss Calculation (always FP32, compiled for kernel fusion)
-      loss_state, group_mse = self._compiled_compute_losses(
-        pred_rep_states,
-        pred_aux_states,
-        all_rep_states[:, 1:],
-        all_aux_states[:, 1:],
-      )
-
-      # 3. Backprop
-      _optimize_step(self.optimizers, loss_state, self._all_params, max_norm=1.0)
-
-      # 4. Logging
-      stats.append(torch.cat([loss_state.unsqueeze(0), group_mse]).detach())
+      if self.execution == "full":
+        loss, outputs = self._loss_from(td)
+        _optimize_step(self.optimizers, loss, self._all_params, max_norm=1.0)
+      else:
+        outputs = self._gradient_step(td)
+      stats.append(outputs["stats"].clone())
 
     names = ["state", *self.loss_group_weights]
     means = torch.stack(stats).mean(0)
     return {f"Loss/{name}": m for name, m in zip(names, means, strict=True)}
+
+  def _loss_from(self, td: TensorDict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    full_states = td["state"]
+    actions = td["action"]
+
+    all_rep_states = self._compiled_represent(full_states)
+
+    all_aux_states = self.representation.extract_aux_state(full_states)
+    init_rep_state = all_rep_states[:, 0, :]
+    init_aux = all_aux_states[:, 0, :]
+
+    sim_ctx = td["sim_ctx"][:, 0]
+
+    pred_rep_states, pred_aux_states = self._compiled_rollout(
+      init_rep_state, actions, init_aux, sim_ctx
+    )
+
+    # 2. Vectorized Loss Calculation (always FP32, compiled for kernel fusion)
+    loss_state, group_mse = self._compiled_compute_losses(
+      pred_rep_states,
+      pred_aux_states,
+      all_rep_states[:, 1:],
+      all_aux_states[:, 1:],
+    )
+
+    return loss_state, {
+      "stats": torch.cat([loss_state.unsqueeze(0), group_mse]).detach()
+    }
 
   def _rollout(
     self,

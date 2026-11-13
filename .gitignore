@@ -222,7 +222,8 @@ __marimo__/
 /videos/
 
 # Local tests, editor settings, datasets, and training outputs are not published.
-tests/
+tests/*
+!tests/distributed_worker.py
 test/
 .vscode/
 /data/

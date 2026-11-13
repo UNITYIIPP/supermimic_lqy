@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import statistics
 import time
 from collections import deque
 from pathlib import Path
@@ -8,6 +7,8 @@ from pathlib import Path
 import torch
 import wandb
 from torch.utils.tensorboard import SummaryWriter
+
+from supermimic.utils import distributed as distributed
 
 
 class Logger:
@@ -83,7 +84,7 @@ class Logger:
 
   def _episode_extras(self) -> dict[str, float]:
     """Mean of each episode extra over the episodes since the last log."""
-    means = {}
+    pairs = {}
     all_keys = dict.fromkeys(k for extra in self.ep_extras for k in extra)
     for key in all_keys:
       infotensor = torch.tensor([], device=self.device)
@@ -101,8 +102,8 @@ class Logger:
         infotensor = torch.cat((infotensor, val))
 
       if len(infotensor) > 0:
-        means[key] = torch.mean(infotensor).item()
-    return means
+        pairs[key] = (infotensor.sum().item(), infotensor.numel())
+    return distributed.mean_metrics(pairs, self.device)
 
   def _build_console_log(
     self,
@@ -137,21 +138,13 @@ class Logger:
     for key, value in losses.items():
       log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
 
-    if len(self.rewbuffer) > 0:
-      log_string += (
-        f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
-      )
-      log_string += (
-        f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
-      )
-
     for key, value in extras.items():
       label = f"{key}:" if "/" in key else f"Episode {key}:"
       log_string += f"""{label:>{pad}} {value:.4f}\n"""
 
-    done_it = it + 1
-    remaining_it = total_it - done_it
-    eta = self.tot_time / done_it * remaining_it if done_it > 0 else 0.0
+    done_it = max(it, 1)
+    remaining_it = max(total_it - it, 0)
+    eta = self.tot_time / done_it * remaining_it
     log_string += (
       f"""{"-" * width}\n"""
       f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
@@ -173,6 +166,18 @@ class Logger:
     width: int = 80,
     pad: int = 40,
   ) -> None:
+    times = distributed.max_values(
+      {"collect": collect_time, "wm": wm_learn_time, "policy": policy_learn_time},
+      self.device,
+    )
+    collect_time, wm_learn_time, policy_learn_time = (
+      times["collect"],
+      times["wm"],
+      times["policy"],
+    )
+    steps = torch.tensor(num_collected_steps, device=self.device, dtype=torch.long)
+    distributed.sum_(steps)
+    num_collected_steps = int(steps.item())
     iteration_time = collect_time + wm_learn_time + policy_learn_time
     self.tot_timesteps += num_collected_steps
     self.tot_time += iteration_time
@@ -185,15 +190,29 @@ class Logger:
       torch.stack([loss_dict[k] for k in on_device]).tolist() if on_device else []
     )
     losses = {**loss_dict, **dict(zip(on_device, values, strict=True))}
-    row = losses | {
-      "Perf/total_fps": fps,
-      "Perf/collection_time": collect_time,
-      "Perf/wm_learning_time": wm_learn_time,
-      "Perf/policy_learning_time": policy_learn_time,
-    }
-    if len(self.rewbuffer) > 0:
-      row["Train/mean_reward"] = statistics.mean(self.rewbuffer)
-      row["Train/mean_episode_length"] = statistics.mean(self.lenbuffer)
+    losses = distributed.mean_metrics(
+      {k: (float(v), 1) for k, v in losses.items()}, self.device
+    )
+    episode = distributed.mean_metrics(
+      {
+        "Train/mean_reward": (sum(self.rewbuffer), len(self.rewbuffer)),
+        "Train/mean_episode_length": (sum(self.lenbuffer), len(self.lenbuffer)),
+      },
+      self.device,
+    )
+    self.ep_extras.clear()
+    if distributed.rank() != 0:
+      return
+    row = (
+      losses
+      | episode
+      | {
+        "Perf/total_fps": fps,
+        "Perf/collection_time": collect_time,
+        "Perf/wm_learning_time": wm_learn_time,
+        "Perf/policy_learning_time": policy_learn_time,
+      }
+    )
     row |= {k if "/" in k else f"Episode/{k}": v for k, v in extras.items()}
     if self._writer is not None:
       for name, value in row.items():
@@ -212,7 +231,7 @@ class Logger:
         wm_learn_time,
         policy_learn_time,
         losses,
-        extras,
+        extras | episode,
         iteration_time,
         width,
         pad,

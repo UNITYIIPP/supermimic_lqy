@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 import torch
 
+from supermimic.utils.distributed import sum_
+
 
 @dataclass
 class ReturnSamplerCfg:
@@ -139,15 +141,35 @@ class ReturnSampler:
     bins = keys % self.bin_count
     new = torch.zeros_like(self.count).scatter_add_(0, bins, torch.ones_like(samples))
     total = torch.zeros_like(self.value).scatter_add_(0, bins, samples)
-    self.count = self.count.clamp(max=self.cfg.memory) + new
-    self.value = torch.where(
-      new > 0, self.value + (total - new * self.value) / self.count, self.value
+    # Reduce new observations, not historical counts/means. All ranks share V.
+    # The runner records under inference_mode; NCCL needs ordinary tensor storage.
+    with torch.inference_mode(False):
+      stats = torch.stack([new, total]).clone()
+      sum_(stats)
+    new, total = stats.unbind(0)
+    self.count.copy_(self.count.clamp(max=self.cfg.memory) + new)
+    self.value.copy_(
+      torch.where(
+        new > 0,
+        self.value + (total - new * self.value) / self.count.clamp_min(1),
+        self.value,
+      )
     )
 
-  def _distribution(self) -> torch.Tensor:
+  def _distribution(self, update_effort: bool = True) -> torch.Tensor:
     cfg = self.cfg
     focus = torch.softmax(-cfg.steepness * self.value / self.v_max, dim=0)
-    self.effort += focus.double().square()
+    if update_effort:
+      self.effort += focus.double().square()
     keep = (self.effort / self.effort.sum()).float()
     explore = cfg.explore / self.bin_count
     return explore + (1.0 - cfg.explore - cfg.keep) * focus + cfg.keep * keep
+
+  def state_dict(self) -> dict[str, torch.Tensor]:
+    # Per-env windows are deliberately reset when replay is re-warmed on resume.
+    return {name: getattr(self, name).clone() for name in ("value", "count", "effort")}
+
+  def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+    for name in ("value", "count", "effort"):
+      getattr(self, name).copy_(state[name])
+    self._step = 0

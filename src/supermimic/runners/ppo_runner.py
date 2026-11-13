@@ -211,7 +211,7 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
 
         if iteration % self.cfg.log_interval == 0:
           self.logger.log(
-            it=iteration,
+            it=iteration + 1,
             total_it=self.cfg.max_iterations,
             collect_time=collect_time,
             wm_learn_time=wm_learn_time,
