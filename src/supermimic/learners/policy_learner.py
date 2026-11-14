@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -11,9 +12,13 @@ from tensordict import TensorDict
 from supermimic.envs.world_model_env import WorldModelEnv
 from supermimic.learners.learner_utils import (
   CapturedUpdate,
+  Execution,
+  GradientStep,
+  Timings,
   _optimize_step,
   build_optimizers,
   graph_state,
+  resolve_execution,
 )
 
 
@@ -67,10 +72,14 @@ class BpttPolicyLearner:
     wm_env: WorldModelEnv,
     cfg: BpttPolicyLearnerCfg,
     device: str = "cpu",
+    execution: Execution = "auto",
+    profile: bool = False,
   ):
     self.actor = policy
     self.wm_env = wm_env
     self.cfg = cfg
+    self.execution: Execution = resolve_execution(execution, profile)
+    self.timings = Timings(profile, device)
     self.actor_params = list(self.actor.parameters())
     self.actor_optimizers = build_optimizers(
       [self.actor], self.cfg.lr, betas=(0.9, self.cfg.beta2), device=device
@@ -79,6 +88,14 @@ class BpttPolicyLearner:
       torch.compile(self.actor) if torch.device(device).type == "cuda" else self.actor
     )
     self._captured_update = CapturedUpdate(self._update_from, self._graph_state)
+    self._actor_step = GradientStep(
+      self._actor_loss,
+      [self.actor, wm_env.dynamics, wm_env.representation],
+      self.actor_optimizers,
+      self.execution,
+      cfg.grad_clip_value,
+      profile=profile,
+    )
 
   def update(self) -> dict[str, torch.Tensor]:
     self.actor.train()
@@ -86,19 +103,47 @@ class BpttPolicyLearner:
       module.eval()
       module.requires_grad_(False)
     starts = [self.wm_env.sample_initial_states() for _ in range(self.cfg.num_batches)]
-    return self._captured_update(torch.stack(starts))
+    batches = cast(TensorDict, TensorDict.stack(starts))
+    if self.execution == "full":
+      return self._captured_update(batches)
+    return self._update_from(batches)
 
   def _update_from(self, starts: TensorDict) -> dict[str, torch.Tensor]:
     totals: dict[str, torch.Tensor] = {}
     for start in starts.unbind(0):
       for k, v in self._train_batch(start).items():
-        totals[k] = totals[k] + v if k in totals else v
+        totals[k] = totals[k] + v if k in totals else v.clone()
     n = self.cfg.num_batches
     reward = totals.pop("return") / self.cfg.horizon / n / self.wm_env.representation.dt
     return {"Policy/reward": reward} | {f"Policy/{k}": v / n for k, v in totals.items()}
 
   def _train_batch(self, start: TensorDict) -> dict[str, torch.Tensor]:
     """Imagine one rollout from ``start`` and take one actor step on its return."""
+    with self.timings.measure("actor"):
+      if self.execution == "full":
+        loss, outputs = self._actor_loss(start)
+        grad_norm = _optimize_step(
+          self.actor_optimizers, loss, self.actor_params, 1.0, self.cfg.grad_clip_value
+        )
+        assert grad_norm is not None
+        outputs["grad_norm"] = grad_norm
+      else:
+        outputs = self._actor_step(start)
+    rollout_shape = outputs["reward"].shape
+    steps = TensorDict(
+      {key: outputs.pop(key) for key in ("critic", "reward", "done")},
+      batch_size=rollout_shape,
+    )
+    last_obs = TensorDict(
+      {"critic": outputs.pop("last_critic")}, batch_size=steps.batch_size[1:]
+    )
+    with self.timings.measure("critic"):
+      outputs.update(self._fit_critic(list(steps.unbind(0)), last_obs))
+    return outputs
+
+  def _actor_loss(
+    self, start: TensorDict
+  ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     cfg = self.cfg
     obs = self.wm_env.reset(start)
     ret, aux_loss, survival = 0.0, 0.0, 1.0
@@ -115,13 +160,13 @@ class BpttPolicyLearner:
       obs = next_obs
     ret = ret + self._bootstrap(obs, survival, term_prob)
     loss = (-ret + aux_loss).mean()
-    grad_norm = _optimize_step(
-      self.actor_optimizers, loss, self.actor_params, 1.0, cfg.grad_clip_value
-    )
-    return {
+    steps = cast(TensorDict, TensorDict.stack(rollout))
+    return loss, {
       "return": ret.mean().detach(),
-      "grad_norm": grad_norm,
-      **self._fit_critic(rollout, obs),
+      "critic": steps["critic"],
+      "reward": steps["reward"],
+      "done": steps["done"],
+      "last_critic": obs["critic"].detach(),
       **getattr(self.actor, "auxiliary_stats", lambda: {})(),
     }
 
@@ -156,10 +201,26 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     wm_env: WorldModelEnv,
     cfg: ActorCriticPolicyLearnerCfg,
     device: str = "cpu",
+    execution: Execution = "auto",
+    profile: bool = False,
   ):
-    super().__init__(policy, wm_env, cfg, device)
+    super().__init__(policy, wm_env, cfg, device, execution, profile)
     self.critic = critic
     self.critic_optimizers = build_optimizers([critic], self.cfg.lr, device=device)
+    self._actor_step.modules = [
+      self.actor,
+      wm_env.dynamics,
+      wm_env.representation,
+      critic,
+    ]
+    # Include critic buffers/weights in the actor graph address guard.
+    self._critic_step = GradientStep(
+      self._critic_loss,
+      [critic],
+      self.critic_optimizers,
+      self.execution,
+      profile=profile,
+    )
     self._v_max = self.wm_env.max_step_reward / (1 - self.cfg.gamma)
 
   def _bootstrap(
@@ -173,7 +234,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
   def _fit_critic(
     self, rollout: list[TensorDict], last_obs: TensorDict
   ) -> dict[str, torch.Tensor]:
-    steps = torch.stack(rollout)
+    steps = cast(TensorDict, TensorDict.stack(rollout))
     with torch.no_grad():
       values = self.critic(steps["critic"])
       last_value = self.critic(last_obs["critic"])
@@ -185,18 +246,31 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       self.cfg.gamma,
       self.cfg.lam,
     ).clamp(max=self._v_max)
-    obs, returns = steps["critic"].flatten(0, 1), returns.flatten(0, 1)
+    obs = cast(torch.Tensor, steps["critic"]).flatten(0, 1)
+    returns = returns.flatten(0, 1)
     perm = torch.randperm(len(returns) // 4 * 4, device=returns.device)
     self.critic.requires_grad_(True)
     losses = []
     for _ in range(5):
       for idx in perm.view(4, -1):
-        loss = (returns[idx] - self.critic(obs[idx])).pow(2).mean()
-        _optimize_step(
-          self.critic_optimizers, loss, self.critic.parameters(), max_norm=1.0
+        batch = TensorDict(
+          {"obs": obs[idx], "returns": returns[idx]}, batch_size=[len(idx)]
         )
-        losses.append(loss.detach())
+        if self.execution == "full":
+          loss, _ = self._critic_loss(batch)
+          _optimize_step(
+            self.critic_optimizers, loss, self.critic.parameters(), max_norm=1.0
+          )
+        else:
+          loss = self._critic_step(batch)["loss"]
+        losses.append(loss.detach().clone())
     return {"value_function": torch.stack(losses).mean()}
+
+  def _critic_loss(
+    self, batch: TensorDict
+  ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    loss = (batch["returns"] - self.critic(batch["obs"])).pow(2).mean()
+    return loss, {"loss": loss.detach()}
 
   def _graph_state(self) -> list[torch.Tensor]:
     return super()._graph_state() + graph_state([self.critic], self.critic_optimizers)

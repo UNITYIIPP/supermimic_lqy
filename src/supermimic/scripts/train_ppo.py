@@ -41,6 +41,8 @@ class TrainConfig:
 
 
 def main() -> None:
+  if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+    raise ValueError("Use supermimic.scripts.train for multi-GPU; PPO is single-GPU")
   all_tasks = list_tasks()
   chosen_task, remaining_args = tyro.cli(
     tyro.extras.literal_type_from_choices(all_tasks),

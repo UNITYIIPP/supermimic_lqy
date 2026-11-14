@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-import statistics
 import time
 from collections import deque
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
 import wandb
 from torch.utils.tensorboard import SummaryWriter
+
+from supermimic.utils import distributed as distributed
 
 
 class Logger:
@@ -41,6 +43,7 @@ class Logger:
     self.cur_episode_length = torch.zeros(
       self.num_envs, dtype=torch.float, device=self.device
     )
+    self._episode_counts = torch.zeros(4, dtype=torch.long, device=self.device)
 
   def init_tensorboard(self, log_dir: Path) -> None:
     """Write events alongside this run's checkpoints, flushing every 30 seconds."""
@@ -59,8 +62,12 @@ class Logger:
   def process_env_step(
     self,
     rewards: torch.Tensor,
-    terminated: torch.Tensor,
+    dones: torch.Tensor,
     extras: dict,
+    *,
+    failures: torch.Tensor | None = None,
+    motion_end: torch.Tensor | None = None,
+    time_out: torch.Tensor | None = None,
   ) -> None:
     """Add metrics from the environment step to the buffers."""
     if "episode" in extras:
@@ -71,7 +78,13 @@ class Logger:
     self.cur_reward_sum += rewards
     self.cur_episode_length += 1
 
-    flush_mask = terminated | (self.cur_episode_length >= self.max_episode_length)
+    flush_mask = dones.bool() | (self.cur_episode_length >= self.max_episode_length)
+    self._episode_counts[0] += flush_mask.sum()
+    self._episode_counts[1] += (dones if failures is None else failures).bool().sum()
+    if motion_end is not None:
+      self._episode_counts[2] += motion_end.bool().sum()
+    if time_out is not None:
+      self._episode_counts[3] += time_out.bool().sum()
     new_ids = flush_mask.nonzero(as_tuple=False)
     if len(new_ids) > 0:
       self.rewbuffer.extend(self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
@@ -83,7 +96,7 @@ class Logger:
 
   def _episode_extras(self) -> dict[str, float]:
     """Mean of each episode extra over the episodes since the last log."""
-    means = {}
+    pairs = {}
     all_keys = dict.fromkeys(k for extra in self.ep_extras for k in extra)
     for key in all_keys:
       infotensor = torch.tensor([], device=self.device)
@@ -101,8 +114,8 @@ class Logger:
         infotensor = torch.cat((infotensor, val))
 
       if len(infotensor) > 0:
-        means[key] = torch.mean(infotensor).item()
-    return means
+        pairs[key] = (infotensor.sum().item(), infotensor.numel())
+    return distributed.mean_metrics(pairs, self.device)
 
   def _build_console_log(
     self,
@@ -117,6 +130,7 @@ class Logger:
     iteration_time: float,
     width: int,
     pad: int,
+    counters: dict[str, int] | None = None,
   ) -> str:
     """Build the formatted console log string."""
     log_string = f"""{"#" * width}\n"""
@@ -125,6 +139,8 @@ class Logger:
     )
 
     log_string += f"""{"Run name:":>{pad}} {self.run_name}\n"""
+    for name, value in (counters or {}).items():
+      log_string += f"{name + ':':>{pad}} {value}\n"
 
     log_string += (
       f"""{"Total steps:":>{pad}} {self.tot_timesteps} \n"""
@@ -137,21 +153,13 @@ class Logger:
     for key, value in losses.items():
       log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
 
-    if len(self.rewbuffer) > 0:
-      log_string += (
-        f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
-      )
-      log_string += (
-        f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
-      )
-
     for key, value in extras.items():
       label = f"{key}:" if "/" in key else f"Episode {key}:"
       log_string += f"""{label:>{pad}} {value:.4f}\n"""
 
-    done_it = it + 1
-    remaining_it = total_it - done_it
-    eta = self.tot_time / done_it * remaining_it if done_it > 0 else 0.0
+    done_it = max(it, 1)
+    remaining_it = max(total_it - it, 0)
+    eta = self.tot_time / done_it * remaining_it
     log_string += (
       f"""{"-" * width}\n"""
       f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
@@ -168,11 +176,25 @@ class Logger:
     collect_time: float,
     wm_learn_time: float,
     policy_learn_time: float,
-    loss_dict: dict[str, float | torch.Tensor],
+    loss_dict: Mapping[str, float | torch.Tensor],
     num_collected_steps: int,
     width: int = 80,
     pad: int = 40,
+    env_iterations: int | None = None,
+    learning_updates: int | None = None,
   ) -> None:
+    times = distributed.max_values(
+      {"collect": collect_time, "wm": wm_learn_time, "policy": policy_learn_time},
+      self.device,
+    )
+    collect_time, wm_learn_time, policy_learn_time = (
+      times["collect"],
+      times["wm"],
+      times["policy"],
+    )
+    steps = torch.tensor(num_collected_steps, device=self.device, dtype=torch.long)
+    distributed.sum_(steps)
+    num_collected_steps = int(steps.item())
     iteration_time = collect_time + wm_learn_time + policy_learn_time
     self.tot_timesteps += num_collected_steps
     self.tot_time += iteration_time
@@ -180,20 +202,53 @@ class Logger:
 
     extras = self._episode_extras()
     # Device stats reach the host in one transfer.
-    on_device = [k for k, v in loss_dict.items() if isinstance(v, torch.Tensor)]
-    values = (
-      torch.stack([loss_dict[k] for k in on_device]).tolist() if on_device else []
-    )
+    on_device = {k: v for k, v in loss_dict.items() if isinstance(v, torch.Tensor)}
+    values = torch.stack(list(on_device.values())).tolist() if on_device else []
     losses = {**loss_dict, **dict(zip(on_device, values, strict=True))}
-    row = losses | {
-      "Perf/total_fps": fps,
-      "Perf/collection_time": collect_time,
-      "Perf/wm_learning_time": wm_learn_time,
-      "Perf/policy_learning_time": policy_learn_time,
-    }
-    if len(self.rewbuffer) > 0:
-      row["Train/mean_reward"] = statistics.mean(self.rewbuffer)
-      row["Train/mean_episode_length"] = statistics.mean(self.lenbuffer)
+    losses = distributed.mean_metrics(
+      {k: (float(v), 1) for k, v in losses.items()}, self.device
+    )
+    episode = distributed.mean_metrics(
+      {
+        "Train/mean_reward": (sum(self.rewbuffer), len(self.rewbuffer)),
+        "Train/mean_episode_length": (sum(self.lenbuffer), len(self.lenbuffer)),
+      },
+      self.device,
+    )
+    counts = self._episode_counts.clone()
+    distributed.sum_(counts)
+    completed, failed, motion_ends, time_outs = counts.tolist()
+    episode.update(
+      {
+        "Train/completed_episodes": completed,
+        "Train/failed_episodes": failed,
+        "Train/motion_end_count": motion_ends,
+        "Train/time_out_count": time_outs,
+        "Train/failure_rate": failed / completed if completed else 0.0,
+      }
+    )
+    self._episode_counts.zero_()
+    self.ep_extras.clear()
+    if distributed.rank() != 0:
+      return
+    row = (
+      losses
+      | episode
+      | {
+        "Perf/total_fps": fps,
+        "Perf/collection_time": collect_time,
+        "Perf/wm_learning_time": wm_learn_time,
+        "Perf/policy_learning_time": policy_learn_time,
+      }
+    )
+    counters = {"GPU count": distributed.world_size()}
+    if env_iterations is not None:
+      counters["Environment iterations"] = env_iterations
+      row["Counters/env_iterations"] = env_iterations
+    if learning_updates is not None:
+      counters["Learning updates"] = learning_updates
+      row["Counters/learning_updates"] = learning_updates
+    row["Counters/global_env_steps"] = self.tot_timesteps
     row |= {k if "/" in k else f"Episode/{k}": v for k, v in extras.items()}
     if self._writer is not None:
       for name, value in row.items():
@@ -212,10 +267,11 @@ class Logger:
         wm_learn_time,
         policy_learn_time,
         losses,
-        extras,
+        extras | episode,
         iteration_time,
         width,
         pad,
+        counters,
       )
     )
     self.ep_extras.clear()

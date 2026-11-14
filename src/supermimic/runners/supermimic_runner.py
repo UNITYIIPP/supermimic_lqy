@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import glob
 import json
+import os
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+from shutil import copyfile
 from typing import Annotated, Literal
 
 import torch
@@ -18,6 +20,7 @@ from wandb.util import json_friendly_val
 
 from supermimic.envs.motion_tracking_env import MotionTrackingEnv
 from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
+from supermimic.learners.learner_utils import Execution, Timings, resolve_execution
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
   ActorCriticPolicyLearnerCfg,
@@ -37,6 +40,7 @@ from supermimic.tasks.task_spec import (
   build_actor_obs_td,
   resolve_task_specs,
 )
+from supermimic.utils import distributed as distributed
 from supermimic.utils.helpers import (
   extract_action_scale_offset,
   unpack_obs_dims,
@@ -53,6 +57,7 @@ class BaseRunnerCfg:
   """Record metrics and upload models to W&B in addition to local TensorBoard."""
   wandb_project: str = "supermimic"
   run_name: str | None = None
+  log_root: str = "logs"
   wandb_run_path: str | None = None
   headless: bool = True
   buffer_size: int = 1000
@@ -60,6 +65,17 @@ class BaseRunnerCfg:
   actor_obs: str = "proprio"  # "rep_state" or "proprio"
   log_interval: int = 10
   save_interval: int = 1000
+  """Save latest files and checkpoints/model_<step>.pt every N collection iterations."""
+  execution: Execution = "auto"
+  """auto: full graph on one GPU; split forward/backward graphs on multiple GPUs."""
+  profile: bool = False
+  """Synchronize stage boundaries and write per-iteration performance.jsonl."""
+  profile_warmup_iterations: int = 20
+  resume: str | None = None
+  """Path to training_state.pt or a numbered checkpoint; replay/envs are re-warmed."""
+  check_sync_interval: int = 0
+  """Expensive cross-rank model/statistics consistency check; 0 disables."""
+  export_onnx: bool = True
   history_length: int = 1
   termination_softness: float = 0.05
   dynamics_hidden_dims: tuple[int, ...] = (2048, 2048, 2048)
@@ -134,7 +150,9 @@ class WorldModel:
     self.sim_context.load_state_dict(bundle["sim_context"])
 
 
-def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
+def build_world_model(
+  cfg: BaseRunnerCfg, env, device: str, model_seed: int | None = None
+) -> WorldModel:
   """Construct the representation and dynamics for ``env`` sized by ``cfg``.
 
   Resets ``env`` to read its observation dimensions.
@@ -176,14 +194,15 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
   )
 
   action_scale, action_offset = extract_action_scale_offset(env)
-  dynamics = Dynamics(
-    representation,
-    num_actions,
-    sim_ctx_dim,
-    action_scale,
-    action_offset,
-    hidden_dims=cfg.dynamics_hidden_dims,
-  ).to(device)
+  with distributed.model_initialization(model_seed):
+    dynamics = Dynamics(
+      representation,
+      num_actions,
+      sim_ctx_dim,
+      action_scale,
+      action_offset,
+      hidden_dims=cfg.dynamics_hidden_dims,
+    ).to(device)
 
   return WorldModel(
     representation=representation,
@@ -220,10 +239,13 @@ def build_actor(
 def load_wandb_checkpoint(wandb_run_path: str, wm: WorldModel, device: str) -> None:
   """Warm-start ``wm`` from another W&B run's world-model bundle."""
   print(f"[INFO] Loading World Model from W&B: {wandb_run_path}")
-  run = wandb.Api().run(wandb_run_path)
-  wm.load_bundle(
-    torch.load(download_model_dir(run) / "world_model.pt", map_location=device)
-  )
+  path = None
+  if distributed.rank() == 0:
+    run = wandb.Api().run(wandb_run_path)
+    path = str(download_model_dir(run) / "world_model.pt")
+  path = distributed.broadcast_object(path)
+  assert isinstance(path, str)
+  wm.load_bundle(torch.load(path, map_location=device))
 
 
 class Ratio:
@@ -262,12 +284,20 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     task_id: str,
     registry_name: str | None = None,
     device: str = "cuda:0",
+    model_seed: int | None = None,
+    batch_layout: dict | None = None,
   ):
     self.env = env
     self.cfg = cfg
     self.task_id = task_id
     self.registry_name = registry_name
     self.device = device
+    self.model_seed = model_seed
+    self.batch_layout = batch_layout
+    self.log_count = 0
+    self.startup_seconds = 0.0
+    self.training_wall_seconds = 0.0
+    self.execution: Execution = resolve_execution(cfg.execution, cfg.profile)
 
     self._init_common()
     self._init_policy()
@@ -281,7 +311,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     )
 
   def _init_common(self) -> None:
-    wm = build_world_model(self.cfg, self.env, self.device)
+    wm = build_world_model(self.cfg, self.env, self.device, self.model_seed)
     self._wm = wm
     self._representation = wm.representation
     self._dynamics = wm.dynamics
@@ -303,7 +333,12 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       device=self.device,
     )
     self.world_model_learner = WorldModelLearner(
-      self._dynamics, self._representation, self.cfg.wm, device=self.device
+      self._dynamics,
+      self._representation,
+      self.cfg.wm,
+      device=self.device,
+      execution=self.execution,
+      profile=self.cfg.profile,
     )
 
     self._pending_norm_updates: list[tuple] = []
@@ -477,9 +512,15 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
   def _create_log_dir(self, *extra_parts: str) -> Path:
     """Create and return a timestamped log directory."""
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = Path("logs", self.task_id, *extra_parts, timestamp)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = distributed.broadcast_object(
+      datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+      if distributed.rank() == 0
+      else None
+    )
+    assert isinstance(timestamp, str)
+    log_dir = Path(self.cfg.log_root, self.task_id, *extra_parts, timestamp)
+    if distributed.rank() == 0:
+      log_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Logging to {log_dir}")
     return log_dir
 
@@ -489,12 +530,21 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self._run_name = self.cfg.run_name or (
       f"{self.task_id}{name_suffix}-{log_dir.name}"
     )
+    if distributed.rank() != 0:
+      return
     self.logger.init_tensorboard(log_dir)
     run_config = {
       "env_cfg": asdict(self.env.cfg),
       "runner_cfg": asdict(self.cfg),
       "task_id": self.task_id,
       "robot_control": self._wm.robot_control,
+      "distributed": {
+        "world_size": distributed.world_size(),
+        "execution": self.execution,
+        "global_num_envs": self.env.num_envs * distributed.world_size(),
+        "model_seed": self.model_seed,
+        "batch_layout": self.batch_layout,
+      },
     }
     if self._wm.robot_control:
       (log_dir / "robot_control.json").write_text(
@@ -502,9 +552,8 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       )
 
     # Use the same value normalization as W&B without starting a W&B run.
-    (log_dir / "config.json").write_text(
-      json.dumps(json_friendly_val(run_config), indent=2) + "\n"
-    )
+    self._run_config = json_friendly_val(run_config)
+    (log_dir / "config.json").write_text(json.dumps(self._run_config, indent=2) + "\n")
     if not self.cfg.wandb_enabled:
       print("[INFO] W&B recording disabled; using local TensorBoard and checkpoints")
       return
@@ -549,7 +598,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   """
 
   def _init_policy(self) -> None:
-    actor = build_actor(self.cfg, self._wm, self.device)
+    with distributed.model_initialization(
+      self.model_seed + 1 if self.model_seed is not None else None
+    ):
+      actor = build_actor(self.cfg, self._wm, self.device)
     self._active_task_specs = [
       ts for ts in actor.task_specs if self.cfg.slot_mix.get(ts.name, 0.0) > 0.0
     ]
@@ -559,12 +611,21 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       actor.task_specs, actor.slot_ranges(self.env.num_envs), strict=True
     ):
       print(f"  {ts.name}: [{lo}, {hi}) — goal_dim={ts.goal_dim}")
+    for size in (self.env.num_envs, self.cfg.policy.batch_size):
+      for name, (lo, hi) in zip(
+        actor._task_names, actor.slot_ranges(size), strict=True
+      ):
+        if self.cfg.slot_mix.get(name, 0) > 0 and hi <= lo:
+          raise ValueError(f"Local batch {size} leaves active task {name} empty")
     _, critic_input_dim = self._policy_input_dims()
-    critic = build_mlp(
-      critic_input_dim,
-      self.cfg.critic_hidden_dims,
-      output_dim=1,
-    ).to(self.device)
+    with distributed.model_initialization(
+      self.model_seed + 2 if self.model_seed is not None else None
+    ):
+      critic = build_mlp(
+        critic_input_dim,
+        self.cfg.critic_hidden_dims,
+        output_dim=1,
+      ).to(self.device)
 
     policy_cfg = self.cfg.policy
 
@@ -587,12 +648,163 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
     if isinstance(policy_cfg, ActorCriticPolicyLearnerCfg):
       self.policy_learner = ActorCriticPolicyLearner(
-        actor, critic, self.wm_env, policy_cfg, device=self.device
+        actor,
+        critic,
+        self.wm_env,
+        policy_cfg,
+        device=self.device,
+        execution=self.execution,
+        profile=self.cfg.profile,
       )
     else:
       self.policy_learner = BpttPolicyLearner(
-        actor, self.wm_env, policy_cfg, device=self.device
+        actor,
+        self.wm_env,
+        policy_cfg,
+        device=self.device,
+        execution=self.execution,
+        profile=self.cfg.profile,
       )
+
+    modules = self._shared_modules()
+    distributed.check_same(
+      [
+        (key, tuple(t.shape), str(t.dtype))
+        for m in modules
+        for key, t in m.state_dict().items()
+      ],
+      "shared model layout",
+    )
+    sources = self.motion_cmd.cfg.motion_file
+    sources = [sources] if isinstance(sources, (str, Path)) else sources
+    self._motion_manifest = []
+    for pattern in sources:
+      for name in sorted(glob.glob(os.path.expanduser(str(pattern)))):
+        path = Path(name).resolve()
+        stat = path.stat()
+        self._motion_manifest.append((str(path), stat.st_size, stat.st_mtime_ns))
+    distributed.check_same(
+      (self._motion_manifest, self.motion.time_step_total, self.motion_cmd.bin_count),
+      "motion library layout",
+    )
+    distributed.broadcast_modules(modules)
+
+  def _shared_modules(self) -> list[nn.Module]:
+    modules = [self._dynamics, self.policy_learner.actor]
+    critic = getattr(self.policy_learner, "critic", None)
+    if critic is not None:
+      modules.append(critic)
+    return modules
+
+  def _optimizers(self) -> list[torch.optim.Optimizer]:
+    return [
+      *self.world_model_learner.optimizers,
+      *self.policy_learner.actor_optimizers,
+      *getattr(self.policy_learner, "critic_optimizers", []),
+    ]
+
+  def _save_training_state(
+    self, path: Path, step: int, updates: int, collected: int
+  ) -> None:
+    critic = getattr(self.policy_learner, "critic", None)
+    state = {
+      "version": 1,
+      "task_id": self.task_id,
+      "runner_cfg": asdict(self.cfg),
+      "run_config": self._run_config,
+      "world_size": distributed.world_size(),
+      "model_seed": self.model_seed,
+      "motion_manifest": self._motion_manifest,
+      "world_model": self._wm.bundle(),
+      "actor": self.policy_learner.actor.state_dict(),
+      "critic": critic.state_dict() if critic is not None else None,
+      "optimizers": [opt.state_dict() for opt in self._optimizers()],
+      "sampler": self._sampler.state_dict() if self._sampler is not None else None,
+      "next_iteration": step + 1,
+      "iteration": step,
+      "env_iterations": step + 1,
+      "updates": updates,
+      "collected": collected,
+      "training_wall_s": self.training_wall_seconds,
+      "log_count": self.log_count,
+      "batch_layout": self.batch_layout,
+    }
+    tmp = path.with_suffix(".tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+  def _load_training_state(self) -> tuple[int, int, int]:
+    if self.cfg.resume is None:
+      return 0, 0, 0
+    ckpt = torch.load(self.cfg.resume, map_location=self.device, weights_only=False)
+    if ckpt["version"] != 1 or ckpt["task_id"] != self.task_id:
+      raise ValueError("Checkpoint version/task does not match")
+    if ckpt.get("motion_manifest", self._motion_manifest) != self._motion_manifest:
+      raise ValueError("Motion files/order changed; cannot restore the return sampler")
+    self.training_wall_seconds = ckpt.get("training_wall_s", 0.0)
+    previous = ckpt["runner_cfg"]
+    if "log_count" in ckpt and previous["log_interval"] != self.cfg.log_interval:
+      raise ValueError("Resume requires the same log_interval to preserve the log axis")
+    self.log_count = ckpt.get(
+      "log_count", (ckpt["next_iteration"] - 1) // self.cfg.log_interval + 1
+    )
+    print(
+      f"[INFO] Resume batch layout: {ckpt.get('batch_layout')} -> {self.batch_layout}"
+    )
+    for key in (
+      "representation",
+      "actor_obs",
+      "history_length",
+      "slot_mix",
+      "tasks",
+      "sampling_mode",
+      "return_sampler",
+      "latent_bc_weight",
+      "termination_softness",
+    ):
+      if previous[key] != asdict(self.cfg)[key]:
+        raise ValueError(f"Resume configuration mismatch: {key}")
+    # Batch sizes may change on resume; other learner hyperparameters must match.
+    for key in ("wm", "policy"):
+      before = {k: v for k, v in previous[key].items() if k != "batch_size"}
+      after = {k: v for k, v in asdict(self.cfg)[key].items() if k != "batch_size"}
+      if before != after:
+        raise ValueError(f"Resume learner configuration mismatch: {key}")
+    self._wm.load_bundle(ckpt["world_model"])
+    self.policy_learner.actor.load_state_dict(ckpt["actor"])
+    if ckpt["critic"] is not None:
+      critic = getattr(self.policy_learner, "critic", None)
+      if critic is None:
+        raise ValueError("Actor-critic checkpoint cannot resume as pure BPTT")
+      critic.load_state_dict(ckpt["critic"])
+    for opt, state in zip(self._optimizers(), ckpt["optimizers"], strict=True):
+      opt.load_state_dict(state)
+    if self._sampler is not None:
+      self._sampler.load_state_dict(ckpt["sampler"])
+      # Compute probabilities without counting an additional sampling update.
+      if self._sampler.effort.sum() > 0:
+        self.motion_cmd.set_sampling_distribution(self._sampler._distribution(False))
+    print(
+      "[INFO] Restored models/optimizers/sampler; re-warming local replay (not bitwise resume)"
+    )
+    return ckpt["next_iteration"], ckpt["updates"], ckpt["collected"]
+
+  def _check_sync(self) -> None:
+    tensors = [
+      t
+      for module in self._shared_modules()
+      for t in [*module.parameters(), *module.buffers()]
+    ]
+    if self._sampler is not None:
+      tensors += list(self._sampler.state_dict().values())
+    for opt in self._optimizers():
+      tensors += [
+        v
+        for state in opt.state.values()
+        for v in state.values()
+        if isinstance(v, torch.Tensor) and v.is_cuda
+      ]
+    distributed.assert_synced(tensors)
 
   def _build_sim_obs_td(
     self,
@@ -671,7 +883,15 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       )
       self._advance_sim_history(next_obs["actor"].to(self.device), dones)
       terminated = self.env.unwrapped.termination_manager.terminated
-      self.logger.process_env_step(rewards, terminated, extras)
+      manager = self.env.unwrapped.termination_manager
+      self.logger.process_env_step(
+        rewards,
+        dones,
+        extras,
+        failures=terminated,
+        motion_end=manager.get_term("motion_end"),
+        time_out=manager.get_term("time_out"),
+      )
 
       if self._sampler is not None:
         # A failure on a step that also times out counts as the time-out.
@@ -696,18 +916,96 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     for actor_td in actor_inputs:
       self.policy_learner.actor.update_normalization(actor_td)
 
+  def _save_outputs(
+    self, log_dir: Path, step: int, updates: int, collected: int
+  ) -> None:
+    error = None
+    if distributed.rank() == 0:
+      try:
+        self._write_outputs(log_dir, step, updates, collected)
+      except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    error = distributed.broadcast_object(error)
+    if error is not None:
+      raise RuntimeError(f"Checkpoint save failed on rank 0: {error}")
+
+  def _write_outputs(
+    self, log_dir: Path, step: int, updates: int, collected: int
+  ) -> None:
+    if distributed.rank() == 0:
+      checkpoint_dir = log_dir / "checkpoints"
+      checkpoint_dir.mkdir(exist_ok=True)
+      checkpoint_path = checkpoint_dir / f"model_{step:07d}.pt"
+      self._save_training_state(checkpoint_path, step, updates, collected)
+      # Publish the same complete snapshot as latest without serializing it twice.
+      # Replacing this hard link on the next save leaves historical files intact.
+      latest = log_dir / "training_state.pt"
+      temporary = latest.with_suffix(".tmp")
+      temporary.unlink(missing_ok=True)
+      try:
+        os.link(checkpoint_path, temporary)
+      except OSError:
+        # Filesystems without hard links still support independent latest files.
+        copyfile(checkpoint_path, temporary)
+      os.replace(temporary, latest)
+      print(
+        f"[INFO] Saved checkpoint: {checkpoint_path} "
+        f"(env iterations={step + 1}, learning updates={updates}, "
+        f"last log index={self.log_count - 1}, global env steps={collected})"
+      )
+      world_model_path = str(log_dir / "world_model.pt")
+      actor_path = str(log_dir / "actor.pt")
+      self._atomic_save(self._wm.bundle(), world_model_path)
+      self._atomic_save(self.policy_learner.actor.state_dict(), actor_path)
+      files = [world_model_path, actor_path]
+      critic = getattr(self.policy_learner, "critic", None)
+      if critic is not None:
+        critic_path = str(log_dir / "critic.pt")
+        self._atomic_save(critic.state_dict(), critic_path)
+        files.append(critic_path)
+      if self._wm.robot_control:
+        files.append(str(log_dir / "robot_control.json"))
+      if (
+        self.cfg.export_onnx
+        and self._representation.actor_obs_mode == "proprio"
+        and self.motion.time_step_total <= 15_000
+      ):
+        files += export_actor_as_onnx(
+          actor=self.policy_learner.actor,
+          env=self.env.unwrapped,
+          path=str(log_dir),
+          run_name=self._run_name,
+          term_widths=self._representation.proprio_term_widths(self._num_actions),
+        )
+      if self.cfg.wandb_enabled:
+        log_model_artifact(files)
+
+  @staticmethod
+  def _atomic_save(state: dict, path: str) -> None:
+    temporary = path + ".tmp"
+    torch.save(state, temporary)
+    os.replace(temporary, path)
+
   def run(self) -> None:
+    setup_started = time.perf_counter()
+    profile_file = None
     try:
       log_dir = self._create_log_dir()
       self._init_logging(log_dir)
-
+      first_step, updates, total_collected = self._load_training_state()
+      self._check_sync()
+      self.logger.tot_timesteps = total_collected
       self.env.reset()
       self._seed_sim_history()
-
+      if self.cfg.profile and distributed.rank() == 0:
+        profile_file = (log_dir / "performance.jsonl").open("w")
+      timings = Timings(self.cfg.profile, self.device)
+      started = time.perf_counter()
+      self.startup_seconds += started - setup_started
+      prior_wall = self.training_wall_seconds
       print(
-        f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations..."
+        f"[INFO] Training iterations {first_step}..{self.cfg.max_iterations}; execution={self.execution}"
       )
-
       should_train = Ratio(
         self.env.num_envs
         / self.cfg.wm.num_batches
@@ -715,89 +1013,113 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         / self.cfg.wm.horizon
         * self.cfg.replay_ratio
       )
-
+      # Resume starts with an empty buffer; update scheduling restarts after warmup.
       num_collected_steps = 0
-      start_time = time.time()
-      wm_learn_time = 0.0
-      policy_learn_time = 0.0
+      wm_learn_time = policy_learn_time = collect_time = 0.0
       loss_dict: dict[str, torch.Tensor] = {}
-      log_count = 0
-      with ThreadPoolExecutor(max_workers=1) as uploader:
-        upload: Future | None = None
-
-        for step in range(self.cfg.max_iterations):
-          num_collected_steps += self.step()
-
-          for _ in range(should_train(step)):
-            if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
-              continue
-
-            data = (
-              self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
-              for _ in range(self.cfg.wm.num_batches)
-            )
-
-            start_wm_time = time.time()
+      for step in range(first_step, self.cfg.max_iterations):
+        iteration_start = time.perf_counter()
+        t0 = time.perf_counter()
+        with timings.measure("collect"):
+          collected = self.step()
+        collect_time += time.perf_counter() - t0
+        num_collected_steps += collected
+        total_collected += collected * distributed.world_size()
+        iteration_updates = 0
+        for _ in range(should_train(step - first_step)):
+          ready = self.replay_buffer.num_transitions >= self.cfg.wm.horizon
+          data = []
+          if ready:
+            try:
+              data = [
+                self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
+                for _ in range(self.cfg.wm.num_batches)
+              ]
+            except RuntimeError as exc:
+              if "no valid sequences" not in str(exc):
+                raise
+              ready = False
+          if not distributed.all_ready(ready, self.device):
+            continue
+          t0 = time.perf_counter()
+          with timings.measure("wm"):
             wm_logs = self.world_model_learner.update(data)
-            wm_learn_time += time.time() - start_wm_time
+          wm_learn_time += time.perf_counter() - t0
+          t0 = time.perf_counter()
+          policy_logs = self.policy_learner.update()
+          policy_learn_time += time.perf_counter() - t0
+          loss_dict.update(wm_logs)
+          loss_dict.update(policy_logs)
+          updates += 1
+          iteration_updates += 1
 
-            start_policy_time = time.time()
-            policy_logs = self.policy_learner.update()
-            policy_learn_time += time.time() - start_policy_time
-
-            loss_dict.update(wm_logs)
-            loss_dict.update(policy_logs)
-
-          if step % self.cfg.log_interval == 0:
-            elapsed_time = time.time() - start_time
-            total_train_time = wm_learn_time + policy_learn_time
-            collect_time = elapsed_time - total_train_time
-
-            self.logger.log(
-              it=log_count,
-              total_it=self.cfg.max_iterations // self.cfg.log_interval,
-              collect_time=collect_time,
-              wm_learn_time=wm_learn_time,
-              policy_learn_time=policy_learn_time,
-              loss_dict=loss_dict,
-              num_collected_steps=num_collected_steps,
+        if self.cfg.profile:
+          stages = {"collect": 0.0, "wm": 0.0, "actor": 0.0, "critic": 0.0}
+          stages.update(timings.drain())
+          stages.update(self.policy_learner.timings.drain())
+          stages["wm_grad_sync"] = (
+            self.world_model_learner._gradient_step.timings.drain().get(
+              "grad_sync", 0.0
             )
+          )
+          stages["actor_grad_sync"] = (
+            self.policy_learner._actor_step.timings.drain().get("grad_sync", 0.0)
+          )
+          critic_step = getattr(self.policy_learner, "_critic_step", None)
+          stages["critic_grad_sync"] = (
+            critic_step.timings.drain().get("grad_sync", 0.0)
+            if critic_step is not None
+            else 0.0
+          )
+          stages["iteration"] = time.perf_counter() - iteration_start
+          stages = distributed.max_values(stages, self.device)
+          row = {
+            "iteration": step,
+            "phase": (
+              "warmup"
+              if step - first_step < self.cfg.profile_warmup_iterations
+              else "steady"
+            ),
+            "world_size": distributed.world_size(),
+            "execution": self.execution,
+            "global_env_steps": collected * distributed.world_size(),
+            "total_env_steps": total_collected,
+            "updates": iteration_updates,
+            "total_updates": updates,
+            "elapsed_s": time.perf_counter() - started,
+            "startup_s": self.startup_seconds,
+            **{f"{k}_s": v for k, v in stages.items()},
+          }
+          if profile_file is not None:
+            profile_file.write(json.dumps(row) + "\n")
+            profile_file.flush()
 
-            log_count += 1
-            start_time = time.time()
-            wm_learn_time = 0
-            policy_learn_time = 0
-            num_collected_steps = 0
-
-          if step % self.cfg.save_interval == 0:
-            # The previous version must be logged before its files are overwritten.
-            if upload is not None:
-              upload.result()
-            world_model_path = str(log_dir / "world_model.pt")
-            actor_path = str(log_dir / "actor.pt")
-            torch.save(self._wm.bundle(), world_model_path)
-            torch.save(self.policy_learner.actor.state_dict(), actor_path)
-            checkpoint_files = [world_model_path, actor_path]
-            if self._wm.robot_control:
-              checkpoint_files.append(str(log_dir / "robot_control.json"))
-            critic = getattr(self.policy_learner, "critic", None)
-            if critic is not None:
-              critic_path = str(log_dir / "critic.pt")
-              torch.save(critic.state_dict(), critic_path)
-              checkpoint_files.append(critic_path)
-            # Skip ONNX export on huge datasets.
-            if (
-              self._representation.actor_obs_mode == "proprio"
-              and self.motion.time_step_total <= 15_000
-            ):
-              checkpoint_files += export_actor_as_onnx(
-                actor=self.policy_learner.actor,
-                env=self.env.unwrapped,
-                path=str(log_dir),
-                run_name=self._run_name,
-                term_widths=self._representation.proprio_term_widths(self._num_actions),
-              )
-            if self.cfg.wandb_enabled:
-              upload = uploader.submit(log_model_artifact, checkpoint_files)
+        if (
+          self.cfg.check_sync_interval
+          and (step + 1) % self.cfg.check_sync_interval == 0
+        ):
+          self._check_sync()
+        if step % self.cfg.log_interval == 0:
+          self.logger.log(
+            it=self.log_count,
+            total_it=self.cfg.max_iterations // self.cfg.log_interval,
+            collect_time=collect_time,
+            wm_learn_time=wm_learn_time,
+            policy_learn_time=policy_learn_time,
+            loss_dict=loss_dict,
+            num_collected_steps=num_collected_steps,
+            env_iterations=step + 1,
+            learning_updates=updates,
+          )
+          self.log_count += 1
+          collect_time = wm_learn_time = policy_learn_time = 0.0
+          num_collected_steps = 0
+        if step % self.cfg.save_interval == 0 or step + 1 == self.cfg.max_iterations:
+          self.training_wall_seconds = (
+            prior_wall + self.startup_seconds + time.perf_counter() - started
+          )
+          self._save_outputs(log_dir, step, updates, total_collected)
     finally:
+      if profile_file is not None:
+        profile_file.close()
       self._cleanup()

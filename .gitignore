@@ -220,6 +220,7 @@ __marimo__/
 **/artifacts/
 /data/evt/
 /videos/
+/benchmarks/distributed/
 
 # Local tests, editor settings, datasets, and training outputs are not published.
 tests/

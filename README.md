@@ -36,6 +36,9 @@ CUDA_VISIBLE_DEVICES=<GPU_ID> uv run src/supermimic/scripts/train.py \
   <TASK_ID> --runner.run_name <description>
 ```
 
+For single-node multi-GPU training, batch definitions, logging, resume and
+performance measurement, see [Distributed training](docs/distributed_training.md).
+
 Play back a trained model:
 
 ```bash
@@ -55,7 +58,56 @@ uv run src/supermimic/scripts/play.py \
 The directory must contain `config.json`, `actor.pt`, and `world_model.pt`.
 Use the same task ID as training. Omit `--motion-file` to use the motion paths
 saved in the training configuration (relative paths resolve from the current
-working directory). Choose either `--checkpoint-dir` or `--wandb-path`.
+working directory). Choose exactly one of `--checkpoint-dir`, `--checkpoint`,
+or `--wandb-path`.
+
+## Historical checkpoints
+
+The main SuperMimic runner retains complete snapshots in each run's
+`checkpoints/model_<step>.pt`, in addition to updating the latest `actor.pt`,
+`world_model.pt`, `critic.pt` (when present), and `training_state.pt` files.
+Snapshots include the actor, critic, world model, normalizers, optimizers,
+sampler, training counters, run configuration, and saved robot control parameters.
+Only rank 0 writes files in distributed training.
+
+`--runner.save-interval 1000` saves at zero-based collection steps 0, 1000,
+2000, etc., plus the final step on normal completion. For example,
+`model_0001000.pt` contains the state after 1001 collection iterations.
+Step 0 is after the first collection and can precede replay warmup/learning.
+The console's `Learning iteration` remains the log-record index: with
+`log_interval=10`, collection step 1000 corresponds to console index 100.
+GPU count does not multiply checkpoint numbering. The save message also prints
+completed collection iterations, learning updates, last log index, and global
+environment steps. Interrupted runs retain the last completed save; older
+overwritten checkpoints cannot be recovered retroactively.
+
+Select a snapshot to record a video and export its ONNX in the same run:
+
+```bash
+MUJOCO_GL=egl uv run src/supermimic/scripts/play.py SuperMimic-MaxCoord-EVT \
+  --checkpoint logs/SuperMimic-MaxCoord-EVT/<TIMESTAMP>/checkpoints/model_0001000.pt \
+  --motion-file data/evt/walk1_subject1.npz \
+  --viewer none --video --video-duration 30 --export-onnx
+```
+
+Default outputs are `<run>/videos/model_0001000/<task>_<run>_<model>_<time>.mp4`
+and `<run>/exports/model_0001000/policy_motion.{onnx,json}`.
+Override them with `--video-dir` and `--export-dir`.
+For ONNX only, replace the motion/viewer/video options with `--export-only`;
+no motion data or simulation is loaded. Playback and export use the selected
+snapshot's actor, world model, PD gains and action scales, never the latest
+fixed-name model files. New snapshots embed their configuration and may be
+moved outside the run directory; outputs then go beside the checkpoint.
+
+`--checkpoint <run>/training_state.pt` also works. Older complete checkpoints
+without embedded configuration require the owning run's `config.json`.
+For legacy runs containing only `actor.pt` and `world_model.pt`, continue using
+`--checkpoint-dir`. These playback commands target the main multi-encoder
+SuperMimic runner, not the separate `train_ppo.py` policy format.
+
+Resume training from a numbered snapshot by appending
+`--runner.resume <run>/checkpoints/model_0001000.pt` to the original training
+command. Replay and environments re-warm; this is not a bitwise continuation.
 
 ## Training curves
 
