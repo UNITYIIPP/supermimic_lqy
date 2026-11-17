@@ -29,7 +29,11 @@ from supermimic.learners.policy_learner import (
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
-from supermimic.representations import StateRepresentation, create_representation
+from supermimic.representations import (
+  StateRepresentation,
+  create_representation,
+  motion_goal_frame,
+)
 from supermimic.robots.control import control_snapshot
 from supermimic.runners.exporter import export_actor_as_onnx
 from supermimic.runners.reset_sampling import ReturnSampler, ReturnSamplerCfg
@@ -44,6 +48,7 @@ from supermimic.utils.helpers import (
   extract_action_scale_offset,
   unpack_obs_dims,
 )
+from supermimic.utils.history import append_history
 from supermimic.utils.logger import Logger
 from supermimic.utils.wandb_artifacts import download_model_dir, log_model_artifact
 
@@ -110,6 +115,12 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   train.py resolves this into the motion command's cfg before the env is built
   ('return' drives mjlab's 'external' mode)."""
   return_sampler: ReturnSamplerCfg = field(default_factory=ReturnSamplerCfg)
+
+  def __post_init__(self) -> None:
+    if self.history_length < 1:
+      raise ValueError("Robot history length must be positive")
+    if self.tasks.motion.mode == "causal_history" and self.actor_obs != "proprio":
+      raise ValueError("causal_history requires actor_obs='proprio'")
 
 
 @dataclass
@@ -337,6 +348,17 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
     self._pending_norm_updates: list[tuple] = []
     self._sim_history: torch.Tensor | None = None
+    self._sim_goal_histories: dict[str, torch.Tensor] = {}
+    self._goal_history_reset: torch.Tensor | None = None
+
+  @property
+  def _motion_history_length(self) -> int:
+    tasks = getattr(self.cfg, "tasks", None)
+    return (
+      tasks.motion.history_length
+      if tasks is not None and tasks.motion.mode == "causal_history"
+      else 0
+    )
 
   def _seed_sim_history(self) -> None:
     """Seed the real-sim obs-history ring with the noised current sensor."""
@@ -358,13 +380,14 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
   def _advance_sim_history(self, next_actor: torch.Tensor, dones: torch.Tensor) -> None:
     """Append the noised next sensor; rows whose episode just reset repeat that
     single realization, matching the warm-start padding."""
+    self._goal_history_reset = dones.bool()
     if self.cfg.history_length == 1:
       return
     assert self._sim_history is not None
     next_sensor = self._representation.add_proprio_noise(next_actor)
-    shifted = torch.cat([self._sim_history[:, 1:], next_sensor.unsqueeze(1)], dim=1)
-    reset = dones.bool().view(-1, 1, 1)
-    self._sim_history = torch.where(reset, next_sensor.unsqueeze(1), shifted)
+    self._sim_history = append_history(
+      self._sim_history, next_sensor, self.cfg.history_length, dones
+    )
 
   def _policy_input_dims(self) -> tuple[int, int]:
     """Compute actor and critic input dimensions from the representation."""
@@ -437,6 +460,8 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       schema["actor_obs"] = FieldSpec(
         self._representation.proprio_obs_dim(self._num_actions)
       )
+    if self._motion_history_length:
+      schema["motion_goal"] = FieldSpec(2 * self._num_actions + 6)
     schema["sim_ctx"] = FieldSpec(self._sim_context.output_dim)
     return schema
 
@@ -731,7 +756,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     if ckpt.get("motion_manifest", self._motion_manifest) != self._motion_manifest:
       raise ValueError("Motion files/order changed; cannot restore the return sampler")
     self.training_wall_seconds = ckpt.get("training_wall_s", 0.0)
-    previous = ckpt["runner_cfg"]
+    from supermimic.runners.run_config import load_runner_cfg
+
+    previous = asdict(load_runner_cfg({"runner_cfg": ckpt["runner_cfg"]}))
     for key in (
       "representation",
       "actor_obs",
@@ -803,10 +830,18 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       sim_actor_obs=sim_actor_obs if proprio else None,
       noisy=proprio,
     )
-    goals = {
-      ts.name: ts.extract_training_goal(self.motion, motion_times, aux_state)
-      for ts in self._active_task_specs
-    }
+    goals = {}
+    for ts in self._active_task_specs:
+      frame = ts.extract_training_goal(self.motion, motion_times, aux_state)
+      if ts.history_length:
+        self._sim_goal_histories[ts.name] = append_history(
+          self._sim_goal_histories.get(ts.name),
+          frame,
+          ts.history_length,
+          self._goal_history_reset,
+        )
+        frame = self._sim_goal_histories[ts.name]
+      goals[ts.name] = frame
     return build_actor_obs_td(goals, self._collection_history(sensor))
 
   def _configure_reset_sampling(self) -> None:
@@ -855,6 +890,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       extra_fields = {"sim_ctx": sim_ctx}
       if self._stores_actor_obs:
         extra_fields["actor_obs"] = sim_actor_obs
+      if self._motion_history_length:
+        extra_fields["motion_goal"] = motion_goal_frame(
+          self.motion, motion_times, aux_state
+        )
 
       next_obs, rewards, dones, extras = self._step_and_store(
         actions,
@@ -909,7 +948,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       if (
         self.cfg.export_onnx
         and self._representation.actor_obs_mode == "proprio"
-        and self.motion.time_step_total <= 15_000
+        and (self._motion_history_length or self.motion.time_step_total <= 15_000)
       ):
         files += export_actor_as_onnx(
           actor=self.policy_learner.actor,
@@ -917,6 +956,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           path=str(log_dir),
           run_name=self._run_name,
           term_widths=self._representation.proprio_term_widths(self._num_actions),
+          runner_cfg=self.cfg,
+          task_id=self.task_id,
         )
       if self.cfg.wandb_enabled:
         log_model_artifact(files)

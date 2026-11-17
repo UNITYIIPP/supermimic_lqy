@@ -28,6 +28,7 @@ from supermimic.tasks.task_spec import (
   TaskSpec,
   build_actor_obs_td,
 )
+from supermimic.utils.history import append_history
 
 
 def create_wm_vis_model(base_model: mujoco.MjModel) -> mujoco.MjModel:
@@ -105,6 +106,10 @@ class SuperMimicViewerMixin:
     self.curr_pred_rep_state = None
     self.curr_wm_aux = None
     self.last_actions = None
+    self._gt_history = None
+    self._wm_history = None
+    self._gt_goal_history = None
+    self._wm_goal_history = None
 
   def set_task(self, name: str) -> None:
     """Switch the active task. Reroutes the actor through that task's encoder."""
@@ -112,6 +117,10 @@ class SuperMimicViewerMixin:
       raise ValueError(f"Unknown task {name!r}; have {list(self.task_specs)}")
     self.current_task = name
     self.policy.set_slot_mix({name: 1.0})
+    self._gt_history = None
+    self._wm_history = None
+    self._gt_goal_history = None
+    self._wm_goal_history = None
 
   def set_raw_goal(self, task_name: str, idx: int, value: float) -> None:
     """Update one dimension of a task's raw goal."""
@@ -124,15 +133,13 @@ class SuperMimicViewerMixin:
     """Roll the policy's obs-history window forward by one frame and return it.
     A fresh window (``history is None``) repeats the current frame, matching the
     training reset padding; ``history_length == 1`` is just that single frame."""
-    history_length = self.policy.history_length
-    if history_length == 1:
-      return sensor.unsqueeze(1)
-    if history is None:
-      return sensor.unsqueeze(1).repeat(1, history_length, 1)
-    return torch.cat([history[:, 1:], sensor.unsqueeze(1)], dim=1)
+    return append_history(history, sensor, self.policy.history_length)
 
   def _build_actor_goal(
-    self, curr_goals: torch.Tensor, aux_state: torch.Tensor
+    self,
+    curr_goals: torch.Tensor,
+    aux_state: torch.Tensor,
+    motion_times: torch.Tensor | None = None,
   ) -> torch.Tensor:
     """Compute goal_obs for the current task.
 
@@ -142,6 +149,14 @@ class SuperMimicViewerMixin:
     precomputed motion-derived command at the current motion time.
     """
     if self.current_task == "motion":
+      ts = self.task_specs["motion"]
+      if ts.history_length:
+        command = self.env.unwrapped.command_manager.get_term("motion")
+        return ts.extract_training_goal(
+          command.motion,
+          command.time_steps if motion_times is None else motion_times,
+          aux_state,
+        )
       return extract_actor_goal(curr_goals)
     ts = self.task_specs[self.current_task]
     if self._replay_mode.get(self.current_task, False):
@@ -290,8 +305,11 @@ class SuperMimicViewerMixin:
           self.curr_wm_aux = self.representation.extract_aux_state(curr_gt_states)
           self.curr_pred_rep_state = self.representation.represent(curr_gt_states)
           self.sim_ctx = self.sim_context.read(self.env.unwrapped)
-          self._gt_history = None
-          self._wm_history = None
+          # Restart only the prediction; actual policy histories survive a
+          # visualization rollout boundary. Seed WM with the same real past.
+          self._wm_history = self._gt_history
+          self._wm_goal_history = self._gt_goal_history
+          self.last_actions = obs["actor"][..., -self.dynamics.num_actions :].clone()
 
         if self.last_actions is None:
           self.last_actions = torch.zeros(
@@ -301,6 +319,12 @@ class SuperMimicViewerMixin:
         # Actor step on ground-truth obs.
         gt_aux = self.representation.extract_aux_state(curr_gt_states)
         actor_goal = self._build_actor_goal(curr_goals, gt_aux)
+        ts = self.task_specs[self.current_task]
+        if ts.history_length:
+          self._gt_goal_history = append_history(
+            self._gt_goal_history, actor_goal, ts.history_length
+          )
+          actor_goal = self._gt_goal_history
         gt_rep_state = self.representation.represent(curr_gt_states)
         proprio = self.representation.actor_obs_mode == "proprio"
         sensor = self.representation.compute_actor_sensor(
@@ -327,7 +351,14 @@ class SuperMimicViewerMixin:
         )
 
         # Closed-loop actor step on the WM-predicted state.
-        wm_actor_goal = self._build_actor_goal(wm_goal, self.curr_wm_aux)
+        wm_actor_goal = self._build_actor_goal(
+          wm_goal, self.curr_wm_aux, wm_motion_times
+        )
+        if ts.history_length:
+          self._wm_goal_history = append_history(
+            self._wm_goal_history, wm_actor_goal, ts.history_length
+          )
+          wm_actor_goal = self._wm_goal_history
         wm_sensor = self.representation.compute_actor_sensor(
           self.curr_pred_rep_state,
           self.sim_ctx,

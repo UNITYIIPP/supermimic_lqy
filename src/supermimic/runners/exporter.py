@@ -21,7 +21,8 @@ from __future__ import annotations
 import copy
 import json
 import os
-from typing import cast
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
@@ -32,6 +33,9 @@ from mjlab.tasks.tracking.mdp import MotionCommand
 from supermimic.models import MultiEncoderAE
 from supermimic.representations import term_major_to_temporal
 from supermimic.robots.control import control_snapshot
+
+if TYPE_CHECKING:
+  from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
 
 
 def _export_onnx(
@@ -309,12 +313,45 @@ def export_actor_as_onnx(
   path: str,
   run_name: str,
   term_widths: list[int],
+  runner_cfg: SuperMimicRunnerCfg | None = None,
+  task_id: str | None = None,
 ) -> list[str]:
   """Export one ``policy_<task>.onnx`` per encoder in ``actor``.
 
   Returns the list of file paths produced. Unknown task names are skipped
   with a warning rather than erroring.
   """
+  if any(ts.history_length for ts in actor.task_specs):
+    from supermimic.runners.policy_export import export_policy_actor
+
+    if runner_cfg is None or task_id is None:
+      raise ValueError("Causal export requires saved runner_cfg and task_id")
+    control = control_snapshot(env)
+    if control is None:
+      print("[WARN] Skipping causal ONNX export: robot has no control snapshot.")
+      return []
+    motion = cast(MotionCommand, env.command_manager.get_term("motion"))
+    written = []
+    for ts in actor.task_specs:
+      if runner_cfg.slot_mix.get(ts.name, 0) <= 0:
+        continue
+      written.extend(
+        map(
+          str,
+          export_policy_actor(
+            actor,
+            runner_cfg,
+            control,
+            task_id=task_id,
+            body_names=list(motion.cfg.body_names),
+            anchor_body_name=motion.cfg.anchor_body_name,
+            path=Path(path),
+            run_path=run_name,
+            task=ts.name,
+          ),
+        )
+      )
+    return written
   written: list[str] = []
   for ts in actor.task_specs:
     fn = _TASK_EXPORTERS.get(ts.name)

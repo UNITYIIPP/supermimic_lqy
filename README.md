@@ -130,10 +130,68 @@ settings in its world model checkpoint and ONNX metadata. Playback restores
 the saved settings before constructing the environment, so later edits to
 `EVT_CFG` apply to new runs. ONNX `robot_control` metadata contains the full
 precision parameter snapshot alongside the standard deployment fields.
-Automatic ONNX export retains the framework's existing conditions: actor
+In the default `future_window` mode, automatic ONNX export retains the existing conditions: actor
 observations must use `proprio`, and the reference dataset must contain at most
 15,000 frames. The single walking clip above meets this limit; the full dataset
 uses checkpoint saving without automatic ONNX export.
+
+### Causal actor observations
+
+Enable the optional causal reference history when training a new policy:
+
+```bash
+CUDA_VISIBLE_DEVICES=1,2,3 OMP_NUM_THREADS=1 TORCHINDUCTOR_COMPILE_THREADS=4 \
+  uv run torchrun --standalone --nproc-per-node=3 \
+  -m supermimic.scripts.train SuperMimic-MaxCoord-EVT \
+  --motion-file 'data/evt/*.npz' --runner.actor-obs proprio \
+  --runner.history-length 5 --runner.tasks.motion.mode causal_history \
+  --runner.tasks.motion.history-length 5 --runner.run-name evt_causal
+```
+
+For the 29-joint EVT robot the actor receives two windows, both ordered from
+oldest to newest and including the current control step:
+
+| Input | Shape per environment | Contents per frame |
+| --- | --- | --- |
+| Robot `history` | `[5, 93]` | Projected gravity (3), body angular velocity (3), joint position relative to default (29), joint velocity (29), previous action (29) |
+| Reference `goal_motion` | `[5, 64]` | Absolute reference joint position (29), reference file `joint_vel` (29), relative anchor orientation in rot6d (6) |
+
+The windows cover `t-4, t-3, t-2, t-1, t`, or 80 ms of past observations at
+50 Hz. Each relative orientation uses the robot and reference anchor at that
+historical step; cache it rather than recomputing it using the current robot
+orientation. On reset, repeat the first observed frame across both windows,
+retaining its reference file velocity. There is no future-frame wait or backward
+difference velocity calculation. The supplied file velocity may itself have been
+computed using offline processing; live sources must supply a causal velocity
+estimate if end-to-end causality is required.
+
+Normalization is shared across time with 93 robot and 64 reference statistics;
+updates use the newest frame. The motion encoder consumes 320 normalized values
+and emits the existing 32D latent. The decoder consumes 465 robot-history values
+plus that latent (497 total) and emits 29 actions.
+
+The Critic keeps its original 917D input: MaxCoord state (214), privileged motion
+goal (670), and simulation context (33). Its ten reference samples are current
+through nine future frames, spaced five control steps apart (up to 900 ms).
+The dynamics network still receives state, action and simulation context without
+reference goals. Rewards, terminations and multistep optimization are unchanged.
+This is an asymmetric training setup: future targets guide training but are not
+actor inputs at deployment. The velocity task remains separately configured;
+its default centered smoothing is unchanged.
+
+The default remains `future_window`, so old configurations and checkpoints keep
+their original layout. Start a new causal run: an old actor/training-state
+checkpoint cannot be directly resumed into the new architecture. Both history
+lengths are saved in the runner configuration. Replay now stores a 64D reference
+frame alongside each transition; with robot history enabled, storing the added
+93D robot frame and 64D reference frame costs about 2.4 GiB per GPU for the default
+4096 environments and 1000 buffer steps (float32).
+
+EVT causal checkpoints automatically export `policy_motion.onnx` plus its JSON
+contract at checkpoint saves, including for datasets exceeding 15,000 frames.
+The export contains no motion dataset. Inputs are float32 `history: [1,5,93]`
+and `goal_history: [1,5,64]`, output `actions: [1,29]`; normalization is embedded.
+Use the lengths recorded in the JSON contract when configuring different windows.
 
 ```bash
 uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-EVT \
@@ -161,12 +219,13 @@ The ONNX has two **float32** inputs and one output, with batch size fixed at 1:
 
 - `history`: `[1, history_length, obs_dim]`, oldest frame first, newest last.
   Supply unnormalized observations; normalization is included in the graph.
-- `goal`: `[1, goal_dim]`, the externally supplied task target.
+- `goal`: `[1, goal_dim]`, the externally supplied task target in legacy mode;
+  causal motion uses `goal_history: [1, motion_history_length, 64]` as above.
 - `actions`: `[1, num_joints]`, raw policy actions. Convert them with
   `joint_target = action_offset + action_scale * actions`.
 
 For EVT with history length 1, `proprio` history is `[1, 1, 93]`; GenCoord
-`rep_state` history is `[1, 1, 68]`. Motion goals are `[1, 640]`: ten frames of
+`rep_state` history is `[1, 1, 68]`. Legacy motion goals are `[1, 640]`: ten frames of
 `[joint_pos(29), joint_vel(29)]`, followed by ten relative anchor orientations
 (rot6d). Frames are spaced five control steps apart. The JSON sidecar and the
 ONNX `policy_contract` metadata document the precise layout, joint/body order,
@@ -188,6 +247,23 @@ is `motion`. A warning is emitted if the selected encoder had zero training
 slots, since the presence of encoder weights does not establish that it was trained.
 
 ## Recording playback
+
+For a local training run, pass its directory or `training_state.pt` using
+`--checkpoint`. This loads one atomic snapshot of the actor, world model and
+control settings, and works while training continues. W&B is not required;
+supply the reference clip explicitly with `--motion-file`:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 MUJOCO_GL=egl OMP_NUM_THREADS=1 \
+uv run python -m supermimic.scripts.play SuperMimic-MaxCoord-EVT \
+  --checkpoint logs/SuperMimic-MaxCoord-EVT/2026-11-16_23-43-02-665996 \
+  --motion-file /mnt/dataset/lqi3lr/dyh/supermimic/data/evt/walk1_subject1.npz \
+  --viewer none --video --video-duration 30 --video-overlay reference \
+  --video-dir videos/evt_causal
+```
+
+Use exactly one of `--checkpoint` and `--wandb-path`. Local checkpoints also
+support `--export-only --export-dir <DIR>` without reference motions.
 
 Add `--video` to record an MP4 while using Viser or the native viewer:
 

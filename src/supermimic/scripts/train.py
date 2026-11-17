@@ -84,6 +84,14 @@ def run_train(chosen_task: str, args: TrainConfig, device: str) -> None:
     raise ValueError("Environment and learner batch sizes must be positive")
   if args.runner.wm.horizon < 2 or args.runner.buffer_size < args.runner.wm.horizon:
     raise ValueError("Require buffer_size >= wm.horizon >= 2")
+  required_history = max(
+    args.runner.history_length,
+    args.runner.tasks.motion.history_length
+    if args.runner.tasks.motion.mode == "causal_history"
+    else 1,
+  )
+  if required_history > args.runner.buffer_size:
+    raise ValueError("buffer_size must cover both actor history windows")
   if args.runner.sampling_mode == "adaptive" and distributed.world_size() > 1:
     raise ValueError("Multi-GPU supports return/uniform/start sampling; use return")
   if args.runner.log_interval < 1 or args.runner.save_interval < 1:

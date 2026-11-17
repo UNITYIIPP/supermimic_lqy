@@ -200,6 +200,26 @@ def motion_goal_window(
   return frames.reshape(frames.shape[0], -1)
 
 
+def motion_goal_frame(
+  motion: MotionLoader, motion_times: torch.Tensor, aux_state: torch.Tensor
+) -> torch.Tensor:
+  """Current [q_ref, qd_ref, relative anchor rot6d]; never indexes future frames.
+
+  Velocities come directly from the motion file. Relative orientation belongs
+  to this observation's robot pose and must be cached together with the frame.
+  """
+  _, orientation = assemble_anchor_window(
+    aux_state[..., :3],
+    aux_state[..., 3:7],
+    motion.root_pos_w[motion_times, None],
+    motion.root_quat_w[motion_times, None],
+  )
+  return torch.cat(
+    [motion.joint_pos[motion_times], motion.joint_vel[motion_times], orientation],
+    dim=-1,
+  )
+
+
 def motion_anchor_window(
   motion: MotionLoader, motion_times: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:

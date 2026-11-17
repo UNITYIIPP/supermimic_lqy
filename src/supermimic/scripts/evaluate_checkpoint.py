@@ -21,6 +21,7 @@ from supermimic.runners.supermimic_runner import build_actor, build_world_model
 from supermimic.scripts.train_utils import create_env, setup_device
 from supermimic.tasks.task_spec import build_actor_obs_td
 from supermimic.utils.distributed import seed_all
+from supermimic.utils.history import append_history
 
 
 def main(
@@ -60,6 +61,7 @@ def main(
     spec = next(ts for ts in actor.task_specs if ts.name == "motion")
     obs, _ = env.reset()
     history = None
+    goal_history = None
     previous_done = torch.ones(num_envs, device=device, dtype=torch.bool)
     reward_sum = torch.zeros((), device=device)
     failures = torch.zeros((), device=device, dtype=torch.long)
@@ -76,12 +78,13 @@ def main(
           sim_actor_obs=obs["actor"] if cfg.actor_obs == "proprio" else None,
           noisy=False,
         )
-        if history is None:
-          history = sensor.unsqueeze(1).repeat(1, cfg.history_length, 1)
-        else:
-          history = torch.cat([history[:, 1:], sensor.unsqueeze(1)], dim=1)
-          history[previous_done] = sensor[previous_done, None, :]
+        history = append_history(history, sensor, cfg.history_length, previous_done)
         goal = spec.extract_training_goal(motion_cmd.motion, motion_cmd.time_steps, aux)
+        if spec.history_length:
+          goal_history = append_history(
+            goal_history, goal, spec.history_length, previous_done
+          )
+          goal = goal_history
         actions = actor(build_actor_obs_td({"motion": goal}, history))
         obs, reward, done, _ = env.step(actions)
         previous_done = done.bool()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import cast
 
 import torch
 import tyro
@@ -11,14 +12,15 @@ import wandb
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import load_env_cfg
+from mjlab.tasks.tracking.mdp import MotionCommand, MotionCommandCfg
 from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
-from supermimic.representations import extract_actor_goal
 from supermimic.robots.control import restore_control
 from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
 from supermimic.runners.supermimic_runner import build_actor, build_world_model
 from supermimic.tasks.task_spec import build_actor_obs_td
+from supermimic.utils.history import append_history
 from supermimic.utils.wandb_artifacts import (
   download_artifact_cached,
   download_model_dir,
@@ -82,7 +84,9 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       env_cfg.scene.num_envs = n_envs
 
       if motion_file_path:
-        env_cfg.commands["motion"].motion_file = motion_file_path
+        cast(
+          MotionCommandCfg, env_cfg.commands["motion"]
+        ).motion_file = motion_file_path
 
       base_env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
       env = RslRlVecEnvWrapper(base_env)
@@ -94,16 +98,24 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       sim_ctx = wm.sim_context.read(env.unwrapped)
 
       policy = None
+      actions = torch.rand((n_envs, wm.num_actions), device=device) * 2 - 1
       if cfg.use_policy:
         assert policy_state_dict is not None  # use_policy gated the load above
         policy = build_actor(runner_cfg, wm, device)
         policy.set_slot_mix({"motion": 1.0})
         policy.load_state_dict(policy_state_dict)
         policy.eval()
-      else:
-        actions = torch.rand((n_envs, wm.num_actions), device=device) * 2 - 1
 
       obs, _ = env.reset()
+      history = None
+      goal_history = None
+      reset = None
+      motion_cmd = cast(MotionCommand, env.unwrapped.command_manager.get_term("motion"))
+      spec = (
+        next(ts for ts in policy.task_specs if ts.name == "motion")
+        if policy is not None
+        else None
+      )
 
       # Sync CUDA
       if "cuda" in device:
@@ -113,20 +125,28 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       for _ in range(cfg.steps):
         with torch.inference_mode():
           if policy is not None:
+            assert spec is not None
             rep_state = representation.represent(obs["full_state"])
             sensor = representation.compute_actor_sensor(
               rep_state,
               sim_ctx,
               sim_actor_obs=obs["actor"] if runner_cfg.actor_obs == "proprio" else None,
             )
-            # Only the shape matters for timing; pad like training does at reset.
-            history = sensor.unsqueeze(1).repeat(1, runner_cfg.history_length, 1)
-            actor_obs = build_actor_obs_td(
-              {"motion": extract_actor_goal(obs["goal"])}, history
+            history = append_history(history, sensor, runner_cfg.history_length, reset)
+            goal = spec.extract_training_goal(
+              motion_cmd.motion,
+              motion_cmd.time_steps,
+              representation.extract_aux_state(obs["full_state"]),
             )
+            if spec.history_length:
+              goal_history = append_history(
+                goal_history, goal, spec.history_length, reset
+              )
+              goal = goal_history
+            actor_obs = build_actor_obs_td({"motion": goal}, history)
             actions = policy(actor_obs)
 
-          obs, _, _, _ = env.step(actions)
+          obs, _, reset, _ = env.step(actions)
 
       if "cuda" in device:
         torch.cuda.synchronize()

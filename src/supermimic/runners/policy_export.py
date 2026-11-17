@@ -14,7 +14,6 @@ from torch import nn
 from supermimic.models import MultiEncoderAE
 from supermimic.representations import (
   GOAL_FRAME_STRIDE,
-  GOAL_REL_POS_DIM,
   NUM_GOAL_FRAMES,
   create_representation,
 )
@@ -37,7 +36,7 @@ class PolicyOnnx(nn.Module):
 
   def forward(self, history: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
     history_n = self.obs_normalizer(history)
-    z = torch.tanh(self.encoder(self.goal_normalizer(goal)))
+    z = torch.tanh(self.encoder(self.goal_normalizer(goal).flatten(start_dim=1)))
     return self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
 
 
@@ -132,13 +131,14 @@ def export_policy_checkpoint(
   )
   terms = _history_terms(cfg.actor_obs, cfg.representation, joints, bodies)
   goal_dim = state_dict["goal_normalizers.motion._mean"].numel()
-  if goal_dim != NUM_GOAL_FRAMES * (2 * joints + 6):
+  causal = cfg.tasks.motion.mode == "causal_history"
+  if goal_dim != (1 if causal else NUM_GOAL_FRAMES) * (2 * joints + 6):
     raise ValueError("Checkpoint motion goal differs from the current goal layout")
   actor = MultiEncoderAE(
     obs_dim=sum(terms.values()),
     action_dim=joints,
     task_specs=resolve_task_specs(
-      cfg.tasks, representation, goal_dim + GOAL_REL_POS_DIM
+      cfg.tasks, representation, NUM_GOAL_FRAMES * (2 * joints + 9)
     ),
     slot_mix=cfg.slot_mix,
     latent_dim=cfg.latent_dim,
@@ -149,6 +149,35 @@ def export_policy_checkpoint(
   # Strict loading checks architecture, history width and observation mode.
   actor.load_state_dict(state_dict, strict=True)
   actor.eval()
+  return export_policy_actor(
+    actor,
+    cfg,
+    control,
+    task_id=task_id,
+    body_names=body_names,
+    anchor_body_name=anchor_body_name,
+    path=path,
+    run_path=run_path,
+    task=task,
+  )
+
+
+def export_policy_actor(
+  actor: MultiEncoderAE,
+  cfg: SuperMimicRunnerCfg,
+  control: dict,
+  *,
+  task_id: str,
+  body_names: list[str],
+  anchor_body_name: str,
+  path: Path,
+  run_path: str,
+  task: str = "motion",
+) -> list[Path]:
+  """Export a live actor using the same external-goal contract as checkpoints."""
+  control = _validate_control(control, task_id)
+  joints = len(control["joint_names"])
+  terms = _history_terms(cfg.actor_obs, cfg.representation, joints, len(body_names))
   selected = (
     actor.task_specs
     if task == "all"
@@ -158,13 +187,14 @@ def export_policy_checkpoint(
     raise ValueError(f"Checkpoint has no encoder for task: {task}")
   paths = []
   for spec in selected:
+    causal = spec.history_length > 0
     fraction = cfg.slot_mix.get(spec.name, 0.0)
     if fraction == 0:
       print(
         f"[WARN] '{spec.name}' had zero training slots; this encoder may be untrained."
       )
     contract = {
-      "schema_version": 1,
+      "schema_version": 2 if causal else 1,
       "format": "supermimic_policy_external_goal",
       "run_path": run_path,
       "task_id": task_id,
@@ -175,7 +205,10 @@ def export_policy_checkpoint(
       "history_shape": [1, actor.history_length, actor.obs_dim],
       "history_layout": "frame_major_oldest_to_newest",
       "history_terms": terms,
-      "goal_shape": [1, spec.goal_dim],
+      "goal_shape": (
+        [1, spec.history_length, spec.goal_dim] if causal else [1, spec.goal_dim]
+      ),
+      "goal_input_name": "goal_history" if causal else "goal",
       "actions_shape": [1, joints],
       "dtype": "float32",
       "normalization": "included_in_graph; supply unnormalized inputs",
@@ -194,6 +227,20 @@ def export_policy_checkpoint(
         "joint_positions": "absolute radians in robot_control.joint_names order",
         "clip_end": "clamp future frames to the current clip's final frame",
       }
+      contract["motion_goal_mode"] = cfg.tasks.motion.mode
+      contract["critic_goal_mode"] = "future_window; training_only"
+      if causal:
+        contract["goal_layout"] = {
+          "order": "[joint_pos, joint_vel, relative_anchor_rot6d] per frame",
+          "frames": spec.history_length,
+          "frame_offsets_control_steps": list(range(1 - spec.history_length, 1)),
+          "history_layout": "frame_major_oldest_to_newest",
+          "joint_positions": "absolute radians in robot_control.joint_names order",
+          "joint_velocities": "corresponding reference file joint_vel, rad/s",
+          "orientation": "reference anchor relative to robot anchor at that historical observation; first two rotation matrix columns, row-major; cache without recomputing",
+          "reset_padding": "repeat first observed frame in both histories; retain file joint_vel",
+          "future_frames": 0,
+        }
     else:
       contract["goal_layout"] = {
         "terms": ["vx_b", "vy_b", "wz_b"],
@@ -208,7 +255,7 @@ def export_policy_checkpoint(
       _export_module(
         PolicyOnnx(actor, spec.name),
         (torch.zeros(*contract["history_shape"]), torch.zeros(*contract["goal_shape"])),
-        ["history", "goal"],
+        ["history", contract["goal_input_name"]],
         ["actions"],
         str(path),
         f"policy_{spec.name}.onnx",

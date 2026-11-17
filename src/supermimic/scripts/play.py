@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,7 +41,9 @@ PLAY_FLAGS = tuple(f for f in mjlab.TYRO_FLAGS if f is not tyro.conf.FlagConvers
 
 @dataclass
 class PlayConfig:
-  wandb_path: str
+  wandb_path: str | None = None
+  checkpoint: Path | None = None
+  """Local run directory or training_state.pt; uses an atomic training snapshot."""
   export_onnx: bool = False
   """Export a policy without embedded motion before playback."""
   export_only: bool = False
@@ -67,6 +70,8 @@ class PlayConfig:
   """Clip reset position. Video defaults to start; regular play keeps its behavior."""
 
   def __post_init__(self) -> None:
+    if (self.wandb_path is None) == (self.checkpoint is None):
+      raise ValueError("Specify exactly one of --checkpoint or --wandb-path")
     if self.viewer == "none" and not self.video and not self.export_only:
       raise ValueError("--viewer none requires --video or --export-only")
     if self.export_only and self.video:
@@ -91,23 +96,46 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   env_cfg.scene.num_envs = 1
   env_cfg.observations["actor"].enable_corruption = True
 
-  import wandb
+  run = None
+  if cfg.checkpoint is not None:
+    checkpoint = cfg.checkpoint.expanduser().resolve()
+    if checkpoint.is_dir():
+      checkpoint /= "training_state.pt"
+    print(f"[INFO] Loading local checkpoint: {checkpoint}")
+    # One file keeps actor, dynamics, normalizers and control settings coherent
+    # even while the training process atomically replaces its next checkpoint.
+    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    if state["task_id"] != task_id:
+      raise ValueError(f"Checkpoint task is {state['task_id']}, requested {task_id}")
+    runner_cfg = load_runner_cfg({"runner_cfg": state["runner_cfg"]})
+    bundle, actor_state = state["world_model"], state["actor"]
+    config_path = checkpoint.parent / "config.json"
+    saved_config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    run_id, run_path = checkpoint.parent.name, str(checkpoint)
+    print(f"[INFO] Checkpoint completed iteration: {state['next_iteration']}")
+    del state  # release unused critic/optimizer tensors before constructing the env
+  else:
+    import wandb
 
-  print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
-  run = wandb.Api().run(cfg.wandb_path)
-  runner_cfg = load_runner_cfg(run.config)
+    assert cfg.wandb_path is not None
+    print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
+    run = wandb.Api().run(cfg.wandb_path)
+    saved_config = run.config
+    runner_cfg = load_runner_cfg(saved_config)
+    model_dir = download_model_dir(run)
+    bundle = torch.load(
+      model_dir / "world_model.pt", map_location="cpu", weights_only=True
+    )
+    actor_state = torch.load(
+      model_dir / "actor.pt", map_location="cpu", weights_only=True
+    )
+    run_id, run_path = run.id, cfg.wandb_path
   check_representation_matches(task_id, runner_cfg.representation)
-  model_dir = download_model_dir(run)
-  bundle = torch.load(
-    model_dir / "world_model.pt",
-    map_location="cpu" if cfg.export_only else device,
-    weights_only=True,
-  )
   if cfg.export_onnx or cfg.export_only:
     motion_cfg = env_cfg.commands["motion"]
-    saved_motion = run.config.get("env_cfg", {}).get("commands", {}).get("motion", {})
+    saved_motion = saved_config.get("env_cfg", {}).get("commands", {}).get("motion", {})
     paths = export_policy_checkpoint(
-      torch.load(model_dir / "actor.pt", map_location="cpu", weights_only=True),
+      actor_state,
       runner_cfg,
       bundle.get("robot_control"),
       task_id=task_id,
@@ -115,8 +143,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       anchor_body_name=saved_motion.get(
         "anchor_body_name", motion_cfg.anchor_body_name
       ),
-      path=cfg.export_dir or Path("exports") / task_id / run.id,
-      run_path=cfg.wandb_path,
+      path=cfg.export_dir or Path("exports") / task_id / run_id,
+      run_path=run_path,
       task=cfg.export_task,
     )
     for path in paths:
@@ -125,7 +153,9 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       return
   restore_control(env_cfg, bundle.get("robot_control"))
 
-  motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
+  motion_artifacts = (
+    [a for a in run.used_artifacts() if a.type == "motions"] if run is not None else []
+  )
   command_term = env_cfg.commands["motion"]
   assert isinstance(command_term, MotionCommandCfg)
   motion_names: list[str] = []
@@ -150,6 +180,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     )
     motion_names = [a.name.split(":")[0] for a in motion_artifacts]
     print(f"[INFO] Loaded {len(motion_files)} motion(s)")
+  elif cfg.checkpoint is not None:
+    raise ValueError("Local checkpoint playback requires --motion-file")
 
   env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg=env_cfg, device=device))
   recorder = None
@@ -161,7 +193,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     dynamics.eval()
 
     actor = build_actor(runner_cfg, wm, device)
-    actor.load_state_dict(torch.load(model_dir / "actor.pt", map_location=device))
+    actor.load_state_dict(actor_state)
     actor.eval()
 
     wm_vis_model = create_wm_vis_model(env.unwrapped.sim.mj_model)
@@ -192,7 +224,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
 
     if cfg.video:
       timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
-      path = cfg.video_dir / f"{task_id}_{run.id}_{timestamp}.mp4"
+      path = cfg.video_dir / f"{task_id}_{run_id}_{timestamp}.mp4"
       recorder = PlaybackVideoRecorder(
         env.unwrapped,
         path,

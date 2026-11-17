@@ -224,6 +224,7 @@ __marimo__/
 # Local tests, editor settings, datasets, and training outputs are not published.
 tests/*
 !tests/distributed_worker.py
+!tests/test_causal_history.py
 test/
 .vscode/
 /data/

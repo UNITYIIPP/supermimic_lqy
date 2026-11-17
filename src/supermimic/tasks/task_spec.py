@@ -11,13 +11,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from mjlab.utils.lab_api.math import quat_apply_inverse
 from tensordict import TensorDict
 
-from supermimic.representations import actor_goal_dim
+from supermimic.representations import actor_goal_dim, motion_goal_frame
 
 if TYPE_CHECKING:
   from mjlab.tasks.tracking.mdp.commands import MotionLoader
@@ -63,6 +63,8 @@ class TaskSpec:
   goal_specs: tuple[GoalSpec, ...] = ()
   build_inference_goal_obs: BuildInferenceGoalObs | None = None
   raw_goal_dim: int = 0
+  history_length: int = 0
+  """0: flat legacy goal; >0: temporal goal [B,H,goal_dim]."""
   precompute_replay_goal: PrecomputeReplayGoal | None = None
   """Optional noise-free per-frame command table for ONNX-export sanity
   checks and viewer replay mode. Returns shape ``(num_frames, raw_goal_dim)``."""
@@ -82,8 +84,21 @@ def build_actor_obs_td(
   return TensorDict(obs, batch_size=[history.shape[0]], device=history.device)
 
 
-def make_motion_task(representation: "StateRepresentation", num_goals: int) -> TaskSpec:
+def make_motion_task(
+  representation: "StateRepresentation",
+  num_goals: int,
+  cfg: MotionTaskCfg | None = None,
+) -> TaskSpec:
   """Motion-tracking task: goal is the full motion target (actor side)."""
+
+  cfg = cfg or MotionTaskCfg()
+  if cfg.mode == "causal_history":
+    return TaskSpec(
+      name="motion",
+      goal_dim=2 * representation.num_joints + 6,
+      extract_training_goal=motion_goal_frame,
+      history_length=cfg.history_length,
+    )
 
   def extract(motion, motion_times, aux_state):
     _, actor_goal = representation.compute_wm_goal(motion, motion_times, aux_state)
@@ -179,6 +194,19 @@ def make_velocity_task(
 
 
 @dataclass(frozen=True)
+class MotionTaskCfg:
+  mode: Literal["future_window", "causal_history"] = "future_window"
+  history_length: int = 5
+  """Causal reference frames, including current, oldest first at control rate."""
+
+  def __post_init__(self) -> None:
+    if self.mode not in ("future_window", "causal_history"):
+      raise ValueError(f"Unsupported motion goal mode: {self.mode}")
+    if self.history_length < 1:
+      raise ValueError("Motion history length must be positive")
+
+
+@dataclass(frozen=True)
 class VelocityTaskCfg:
   """Body-frame velocity-command task."""
 
@@ -196,6 +224,7 @@ class VelocityTaskCfg:
 class TasksCfg:
   """Per-task hyperparameters. Field order defines slot block ordering."""
 
+  motion: MotionTaskCfg = field(default_factory=MotionTaskCfg)
   velocity: VelocityTaskCfg = field(default_factory=VelocityTaskCfg)
 
 
@@ -206,7 +235,7 @@ def resolve_task_specs(
   device: str = "cpu",
 ) -> list[TaskSpec]:
   return [
-    make_motion_task(representation, num_goals),
+    make_motion_task(representation, num_goals, tasks.motion),
     make_velocity_task(
       tasks.velocity.lin_vel_x_range,
       tasks.velocity.lin_vel_y_range,

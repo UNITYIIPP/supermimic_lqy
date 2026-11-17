@@ -138,6 +138,7 @@ class MultiEncoderAE(nn.Module):
     self.latent_bc_weight = latent_bc_weight
     self.task_specs = task_specs
     self._task_names = [ts.name for ts in task_specs]
+    self.goal_history_lengths = {ts.name: ts.history_length for ts in task_specs}
     # Anchor: the first task. The aux-loss hook regularizes each non-anchor
     # encoder against the anchor encoder on the same state.
     self._anchor = self._task_names[0]
@@ -149,7 +150,9 @@ class MultiEncoderAE(nn.Module):
     )
     self.encoders = nn.ModuleDict(
       {
-        ts.name: build_mlp(ts.goal_dim, hidden_dims, output_dim=latent_dim)
+        ts.name: build_mlp(
+          ts.goal_dim * max(1, ts.history_length), hidden_dims, output_dim=latent_dim
+        )
         for ts in task_specs
       }
     )
@@ -192,7 +195,7 @@ class MultiEncoderAE(nn.Module):
       if lo == hi:
         continue
       goal_n = self.goal_normalizers[name](obs_td[f"goal_{name}"][lo:hi])
-      enc_outs.append(self.encoders[name](goal_n))
+      enc_outs.append(self.encoders[name](goal_n.flatten(start_dim=1)))
 
     self._aux_loss = self._compute_aux_loss(obs_td, slots)
 
@@ -222,9 +225,11 @@ class MultiEncoderAE(nn.Module):
       if name == anchor or lo == hi:
         continue
       goal_n_d = self.goal_normalizers[name](obs_td[f"goal_{name}"][lo:hi]).detach()
-      z = torch.tanh(self.encoders[name](goal_n_d))
+      z = torch.tanh(self.encoders[name](goal_n_d.flatten(start_dim=1)))
       with torch.no_grad():
-        z_anchor = torch.tanh(self.encoders[anchor](anchor_goal_d[lo:hi]))
+        z_anchor = torch.tanh(
+          self.encoders[anchor](anchor_goal_d[lo:hi].flatten(start_dim=1))
+        )
       out[lo:hi] = self.latent_bc_weight * ((z - z_anchor) ** 2).mean(dim=-1)
     return out
 
@@ -245,4 +250,7 @@ class MultiEncoderAE(nn.Module):
     ):
       if lo == hi:
         continue
-      self.goal_normalizers[name].update(obs_td[f"goal_{name}"][lo:hi])
+      goal = obs_td[f"goal_{name}"][lo:hi]
+      if self.goal_history_lengths[name]:
+        goal = goal[:, -1]
+      self.goal_normalizers[name].update(goal)
