@@ -46,6 +46,7 @@ def control_snapshot(env) -> dict | None:
     "joint_names": names,
     "joint_stiffness": model.actuator_gainprm[ctrl, 0].tolist(),
     "joint_damping": (-model.actuator_biasprm[ctrl, 2]).tolist(),
+    "joint_armature": model.dof_armature[robot.indexing.joint_v_adr.tolist()].tolist(),
     "joint_effort_limits": [float(model.actuator_forcerange[i, 1]) for i in ctrl],
     "joint_velocity_limits": [by_name[n].velocity_limit for n in names],
     "velocity_limits_enforced": False,
@@ -82,6 +83,12 @@ def restore_control(env_cfg, snapshot: dict | None) -> None:
       effort_limit=snapshot["joint_effort_limits"][effective[j["name"]]],
       action_scale=snapshot["action_scale"][effective[j["name"]]],
       default_pos=snapshot["default_joint_pos"][effective[j["name"]]],
+      # Legacy snapshots have no armature field: retain their XML inheritance.
+      armature=(
+        snapshot["joint_armature"][effective[j["name"]]]
+        if "joint_armature" in snapshot
+        else j.get("armature")
+      ),
     )
     for j in raw["joints"]
   )

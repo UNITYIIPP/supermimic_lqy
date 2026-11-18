@@ -2,7 +2,7 @@
 
 Edit ``EVT_CFG`` / ``default_joints`` for new runs. Velocity limits are nominal
 specifications, not hard velocity constraints in MuJoCo. Passive joint dynamics
-come from the XML; ``kd`` below is the separate active PD derivative gain.
+come from the XML unless overridden here; ``kd`` is the active PD derivative gain.
 """
 
 from __future__ import annotations
@@ -34,9 +34,7 @@ TRACKED_BODIES = (
   "wrist_roll_r_link",
 )
 FOOT_GEOM_RE = r"^foot_(left|right)_.*$"
-_ASSET_DIR = (
-  Path(__file__).resolve().parents[4] / "allmimic" / "assets" / "robots" / "evt"
-)
+_ASSET_DIR = Path(__file__).resolve().parents[3] / "assets" / "robot" / "evt"
 
 
 @dataclass(frozen=True)
@@ -48,6 +46,8 @@ class JointCfg:
   velocity_limit: float
   default_pos: float = 0.0
   action_scale: float = 0.25
+  # None inherits XML; a numeric value replaces the XML joint armature.
+  armature: float | None = None
 
   def __post_init__(self) -> None:
     # Tyro validates nested dataclass defaults strictly, including numeric types.
@@ -60,23 +60,40 @@ class JointCfg:
       "action_scale",
     ):
       object.__setattr__(self, name, float(getattr(self, name)))
+    if self.armature is not None:
+      value = float(self.armature)
+      if not math.isfinite(value) or value < 0:
+        raise ValueError(f"invalid armature: {self.name}")
+      object.__setattr__(self, "armature", value)
 
 
 def default_joints() -> tuple[JointCfg, ...]:
-  """Canonical kinematic order; values supplied for this EVT experiment."""
+  """Canonical order; scales/armatures from dex_evt, original PD/limits retained."""
   joints = []
   for side in ("l", "r"):
-    for name, kp, kd, effort, velocity, q0 in (
-      ("hip_pitch", 300, 15, 235, 16.755160819145562, -0.25),
-      ("hip_roll", 300, 15, 235, 16.755160819145562, 0.0),
-      ("hip_yaw", 150, 7.5, 150, 13.82300767579509, 0.0),
-      ("knee_pitch", 350, 15, 400, 11.100294042683936, 0.5),
-      ("ankle_pitch", 30, 3.75, 55, 14.137166941154069, -0.25),
-      ("ankle_roll", 16.8, 2.1, 55, 14.137166941154069, 0.0),
+    for name, kp, kd, effort, velocity, q0, scale, armature in (
+      ("hip_pitch", 300, 15, 235, 16.755160819145562, -0.25, 0.5, 0.29),
+      ("hip_roll", 300, 15, 235, 16.755160819145562, 0.0, 0.5, 0.29),
+      ("hip_yaw", 150, 7.5, 150, 13.82300767579509, 0.0, 0.5, 0.22),
+      ("knee_pitch", 350, 15, 400, 11.100294042683936, 0.5, 0.5, 0.44),
+      ("ankle_pitch", 30, 3.75, 55, 14.137166941154069, -0.25, 0.5, 0.038),
+      ("ankle_roll", 16.8, 2.1, 55, 14.137166941154069, 0.0, 0.3, 0.038),
     ):
-      joints.append(JointCfg(f"{name}_{side}_joint", kp, kd, effort, velocity, q0))
-  for name, kd in (("yaw", 7.5), ("roll", 15), ("pitch", 15)):
-    joints.append(JointCfg(f"waist_{name}_joint", 400, kd, 91, 9.42477796076938))
+      joints.append(
+        JointCfg(f"{name}_{side}_joint", kp, kd, effort, velocity, q0, scale, armature)
+      )
+  for name, kd, scale in (("yaw", 7.5, 0.5), ("roll", 15, 0.3), ("pitch", 15, 0.4)):
+    joints.append(
+      JointCfg(
+        f"waist_{name}_joint",
+        400,
+        kd,
+        91,
+        9.42477796076938,
+        action_scale=scale,
+        armature=0.20,
+      )
+    )
   for side in ("l", "r"):
     for name, kp, kd, effort, velocity, q0 in (
       ("shoulder_pitch", 150, 5, 90, 7.218332720398149, 0.0),
@@ -87,7 +104,19 @@ def default_joints() -> tuple[JointCfg, ...]:
       ("wrist_pitch", 20, 2, 36, 9.739, 0.0),
       ("wrist_roll", 20, 2, 36, 9.739, 0.0),
     ):
-      joints.append(JointCfg(f"{name}_{side}_joint", kp, kd, effort, velocity, q0))
+      armature = 0.028 if name in {"elbow_yaw", "wrist_pitch", "wrist_roll"} else 0.036
+      joints.append(
+        JointCfg(
+          f"{name}_{side}_joint",
+          kp,
+          kd,
+          effort,
+          velocity,
+          q0,
+          action_scale=0.5,
+          armature=armature,
+        )
+      )
   return tuple(joints)
 
 
@@ -179,6 +208,7 @@ def get_robot_cfg(cfg: EvtRobotCfg | None = None) -> EvtEntityCfg:
           stiffness=j.kp,
           damping=j.kd,
           effort_limit=j.effort_limit,
+          armature=j.armature,
           delay_min_lag=cfg.delay_min_lag,
           delay_max_lag=cfg.delay_max_lag,
         )

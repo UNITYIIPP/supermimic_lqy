@@ -11,14 +11,40 @@ Install [uv](https://docs.astral.sh/uv/):
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Clone both repos as siblings:
+This workstation uses the project-specific **`.venv-cu128`** environment:
+
+| Component | Installed configuration |
+| --- | --- |
+| Project directory | `/home/mig/dou/supermimic_lqy/supermimic_lqy` |
+| Python interpreter | `.venv-cu128/bin/python` (Python 3.13.18) |
+| GPU | NVIDIA GeForce RTX 5090 |
+| PyTorch | 2.11.0+cu128 (CUDA 12.8) |
+| MuJoCo / MuJoCo-Warp | 3.16.0 |
+| Warp | 1.19.0+cu12 |
+| mjlab | 1.6.0, editable from `../mjlab_research` |
+| rsl-rl-lib | 5.5.2 |
+
+The environment is already installed. To reinstall its locked dependencies and
+run the CUDA/import checks, use the local workspace configuration:
 
 ```bash
-mkdir supermimic_ws && cd supermimic_ws
-git clone https://github.com/UNITYIIPP/supermimic_lqy.git supermimic
-git clone git@github.com:kevinzakka/mjlab_research.git
-cd supermimic
+bash /home/mig/dou/supermimic_lqy/env-cu128/setup.sh
+cd /home/mig/dou/supermimic_lqy/supermimic_lqy
 ```
+
+Use `uv run --no-project --python .venv-cu128/bin/python` for all commands below;
+activation is not required. `--no-project` bypasses the original `uv.lock`, whose
+CUDA dependencies differ from this workstation's configuration. Plain `uv run`
+or `uv sync` would create/use `.venv` and resolve the original project dependencies.
+The unused, empty `.venv` has been removed.
+
+This configuration explicitly overrides mjlab's declared `torch>=2.14.0`
+requirement with `torch==2.11.0+cu128`; `uv pip check` may report that mismatch.
+Python imports and PyTorch CUDA device detection have been verified locally;
+these checks alone do not establish full training compatibility.
+See [the local environment guide](../env-cu128/README.md) for the dependency lock,
+verification script and dependency update procedure. These environment files
+live alongside this repository and must be retained when moving the workspace.
 
 ## Usage
 
@@ -32,14 +58,16 @@ Available task IDs:
 Train a world model and policy:
 
 ```bash
-CUDA_VISIBLE_DEVICES=<GPU_ID> uv run src/supermimic/scripts/train.py \
+CUDA_VISIBLE_DEVICES=<GPU_ID> uv run --no-project --python .venv-cu128/bin/python \
+  src/supermimic/scripts/train.py \
   <TASK_ID> --runner.run_name <description>
 ```
 
 Play back a trained model:
 
 ```bash
-uv run src/supermimic/scripts/play.py \
+uv run --no-project --python .venv-cu128/bin/python \
+  src/supermimic/scripts/play.py \
   <TASK_ID> --wandb-path <RUN_PATH>
 ```
 
@@ -68,13 +96,13 @@ uses the basic tracking environment, with 14 tracked bodies, pelvis as anchor,
 randomization in `[0.3, 1.2]`; base COM and encoder bias randomization are retained.
 The original G1 environment factories remain in `tasks/env_cfgs.py`.
 
-First synchronize dependencies, then convert the existing **EVT** compact motions
+After setting up the environment above, convert the existing **EVT** compact motions
 (`root_pos` + `rest`, 50 Hz, wxyz quaternions, world-frame root velocities):
 
 ```bash
-uv sync --group dev
-uv run -m supermimic.scripts.convert_evt_motions \
-  --input-path ../allmimic/data/Lafan_urdf --output-dir data/evt
+uv run --no-project --python .venv-cu128/bin/python \
+  -m supermimic.scripts.convert_evt_motions \
+  --input-path /home/mig/dou/allmimic/data/train_data --output-dir data/evt
 ```
 
 The converter accepts a single clip, a packed archive with clip boundaries, a
@@ -85,7 +113,8 @@ Existing outputs require an explicit `--overwrite`.
 Start with one motion and a small environment batch:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 uv run src/supermimic/scripts/train.py \
+CUDA_VISIBLE_DEVICES=0 uv run --no-project --python .venv-cu128/bin/python \
+  src/supermimic/scripts/train.py \
   SuperMimic-GenCoord-EVT --motion-file data/evt/walk1_subject1.npz \
   --num-envs 64 --runner.actor-obs proprio --runner.run-name evt_walk \
   --runner.wm.batch-size 64 --runner.policy.batch-size 64
@@ -108,7 +137,8 @@ observations must use `proprio`, and the reference dataset must contain at most
 uses checkpoint saving without automatic ONNX export.
 
 ```bash
-uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-EVT \
+uv run --no-project --python .venv-cu128/bin/python \
+  src/supermimic/scripts/play.py SuperMimic-GenCoord-EVT \
   --wandb-path <RUN_PATH> --motion-file data/evt/walk1_subject1.npz
 ```
 
@@ -117,7 +147,8 @@ uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-EVT \
 Export the saved EVT policy without loading any NPZ files or starting a simulator:
 
 ```bash
-uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-EVT \
+uv run --no-project --python .venv-cu128/bin/python \
+  src/supermimic/scripts/play.py SuperMimic-GenCoord-EVT \
   --wandb-path <RUN_PATH> --export-only --export-dir exports/evt
 ```
 
@@ -164,7 +195,8 @@ slots, since the presence of encoder weights does not establish that it was trai
 Add `--video` to record an MP4 while using Viser or the native viewer:
 
 ```bash
-uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-EVT \
+uv run --no-project --python .venv-cu128/bin/python \
+  src/supermimic/scripts/play.py SuperMimic-GenCoord-EVT \
   --wandb-path <RUN_PATH> --motion-file data/evt/walk1_subject1.npz \
   --viewer viser --video --video-duration 30 --video-dir videos/play
 ```
@@ -173,7 +205,8 @@ For a server without a desktop, use `--viewer none`. It exits automatically
 when recording finishes and does not require a browser connection:
 
 ```bash
-MUJOCO_GL=egl uv run src/supermimic/scripts/play.py SuperMimic-GenCoord-EVT \
+MUJOCO_GL=egl uv run --no-project --python .venv-cu128/bin/python \
+  src/supermimic/scripts/play.py SuperMimic-GenCoord-EVT \
   --wandb-path <RUN_PATH> --motion-file data/evt/walk1_subject1.npz \
   --viewer none --video --video-duration 30 \
   --video-width 1280 --video-height 720 --video-overlay reference

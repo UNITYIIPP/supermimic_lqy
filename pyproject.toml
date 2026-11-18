@@ -33,7 +33,7 @@ ignore = ["B011"]
 [tool.pyright]
 pythonVersion = "3.13"
 venvPath = "."
-venv = ".venv"
+venv = ".venv-cu128"
 include = ["src"]
 
 [dependency-groups]
