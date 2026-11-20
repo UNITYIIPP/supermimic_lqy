@@ -1,5 +1,6 @@
 """Causal input, replay boundaries, imagination gradients and export parity."""
 
+import json
 from copy import deepcopy
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -12,6 +13,10 @@ from onnx.reference import ReferenceEvaluator
 from tensordict import TensorDict
 
 from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
+from supermimic.learners.policy_learner import (
+  ActorCriticPolicyLearner,
+  ActorCriticPolicyLearnerCfg,
+)
 from supermimic.models import MultiEncoderAE
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.representations import (
@@ -20,6 +25,7 @@ from supermimic.representations import (
   motion_anchor_window,
   motion_goal_frame,
   motion_goal_window,
+  motion_reference_base_lin_vel,
 )
 from supermimic.runners.policy_export import export_policy_checkpoint
 from supermimic.runners.run_config import load_runner_cfg
@@ -40,6 +46,9 @@ def motion_fixture():
     joint_vel=q * 7 + 3,
     root_pos_w=torch.stack([torch.arange(20.0), torch.zeros(20), torch.ones(20)], -1),
     root_quat_w=torch.tensor([1.0, 0.0, 0.0, 0.0]).repeat(20, 1),
+    root_lin_vel_w=torch.stack(
+      [torch.arange(20.0), torch.ones(20), torch.zeros(20)], -1
+    ),
     motion_ends=torch.tensor([10, 20]),
   )
   motion.body_state = lambda t: (
@@ -152,7 +161,7 @@ class TrackingHarness(MultiTaskWorldModelEnv):
     )
 
 
-def replay_fixture():
+def replay_fixture(buffer_size=8):
   schema = {
     "state": FieldSpec(221),
     "prev_action": FieldSpec(29),
@@ -163,9 +172,9 @@ def replay_fixture():
     "terminated": FieldSpec(dtype=torch.bool),
     "truncated": FieldSpec(dtype=torch.bool),
   }
-  replay = ReplayBuffer(schema, 8, 2)
+  replay = ReplayBuffer(schema, buffer_size, 2)
   motion = motion_fixture()
-  for t in range(12):  # wrap buffer and cross a terminal boundary
+  for t in range(buffer_size + 4):  # wrap; oldest retained frame starts an episode
     f = t % 4
     state = torch.zeros(2, 221)
     state[:, 3] = 1
@@ -189,12 +198,9 @@ def replay_fixture():
   return replay, motion
 
 
-@pytest.mark.parametrize(
-  ("sensor_h", "goal_h"), [(5, 5), (1, 5), (5, 1), (3, 5), (5, 3)]
-)
-def test_replay_and_rollout_histories(sensor_h, goal_h):
+def tracking_fixture(sensor_h, goal_h, critic_obs="legacy"):
   _, _, specs, _ = actor_fixture(sensor_h=sensor_h, goal_h=goal_h)
-  replay, motion = replay_fixture()
+  replay, motion = replay_fixture(max(8, sensor_h, goal_h))
 
   def wm_goal(m, t, aux):
     pos, quat = motion_anchor_window(m, t)
@@ -205,7 +211,9 @@ def test_replay_and_rollout_histories(sensor_h, goal_h):
     extract_aux_state=lambda s: s[:, :7],
     joint_state=lambda s: s[:, :58],
     add_proprio_noise=lambda x: x,
-    compute_actor_sensor=lambda s, ctx, **kw: s[:, :93],
+    compute_actor_sensor=lambda s, ctx, **kw: torch.cat(
+      [s[:, :64], kw["last_action"]], -1
+    ),
     compute_wm_goal=wm_goal,
   )
   cfg = SimpleNamespace(
@@ -223,7 +231,18 @@ def test_replay_and_rollout_histories(sensor_h, goal_h):
     command_manager=SimpleNamespace(get_term=lambda _: command),
   )
   env.unwrapped = env
-  wm = TrackingHarness(None, rep, env, 32, replay, specs[:1], sensor_h, 0.05)
+  return TrackingHarness(
+    None, rep, env, 32, replay, specs[:1], sensor_h, 0.05, critic_obs=critic_obs
+  )
+
+
+@pytest.mark.parametrize("critic_obs", ["legacy", "privileged_history"])
+@pytest.mark.parametrize(
+  ("sensor_h", "goal_h"), [(5, 5), (1, 5), (5, 1), (3, 5), (5, 3), (10, 10)]
+)
+def test_replay_and_rollout_histories(sensor_h, goal_h, critic_obs):
+  wm = tracking_fixture(sensor_h, goal_h, critic_obs)
+  motion = wm.motion
   batch = wm.sample_initial_states()
   obs = wm.reset(batch)
   times = batch["motion_time"]
@@ -231,15 +250,38 @@ def test_replay_and_rollout_histories(sensor_h, goal_h):
   torch.testing.assert_close(obs["goal_motion"][..., 0], expected.float())
   expected_s = (times[:, None] + torch.arange(1 - sensor_h, 1)).clamp(min=0)
   torch.testing.assert_close(obs["history"][..., 0], expected_s.float())
-  assert obs["critic"].shape == (32, 917)
+  cfg, rep, _, _ = actor_fixture(sensor_h=sensor_h, goal_h=goal_h)
+  cfg.critic_obs = critic_obs
+  runner = SuperMimicRunner.__new__(SuperMimicRunner)
+  runner.cfg, runner._representation = cfg, rep
+  runner._num_actions, runner._num_goals = 29, 670
+  runner._sim_context = SimpleNamespace(output_dim=33)
+  _, critic_dim = runner._policy_input_dims()
+  assert obs["critic"].shape == (32, critic_dim)
+  torch.testing.assert_close(obs["critic"][:, :214], wm.rep_state)
+  torch.testing.assert_close(obs["critic"][:, 214:884], wm._wm_goal_obs)
+  torch.testing.assert_close(obs["critic"][:, 884:917], wm.sim_ctx)
+  if critic_obs == "privileged_history":
+    assert critic_dim == 920 + 93 * sensor_h + 64 * goal_h
+    torch.testing.assert_close(
+      obs["critic"][:, 917:920], motion_reference_base_lin_vel(motion, times)
+    )
+    torch.testing.assert_close(
+      obs["critic"][:, 920 : 920 + 93 * sensor_h], obs["history"].flatten(1)
+    )
+    torch.testing.assert_close(
+      obs["critic"][:, 920 + 93 * sensor_h :], obs["goal_motion"].flatten(1)
+    )
   # Repeated reads neither advance the window nor change cached orientations.
   saved = obs["goal_motion"].clone()
+  torch.testing.assert_close(wm.get_observations()["critic"], obs["critic"])
   torch.testing.assert_close(wm.get_observations()["goal_motion"], saved)
   actions = torch.ones(32, 29, requires_grad=True)
   next_obs, reward, _, _ = wm.step(actions)
   torch.testing.assert_close(next_obs["goal_motion"][:, :-1], saved[:, 1:])
   expected_frame = motion_goal_frame(motion, times + 1, wm.aux_state)
   torch.testing.assert_close(next_obs["goal_motion"][:, -1], expected_frame)
+  torch.testing.assert_close(next_obs["history"][:, -1, -29:], actions)
   next_obs["goal_motion"][:, -1, -6:].sum().add(reward.sum()).backward()
   assert actions.grad is not None and torch.isfinite(actions.grad).all()
   assert actions.grad.abs().sum() > 0
@@ -275,6 +317,70 @@ def test_real_collection_uses_same_goal_window_and_resets():
   torch.testing.assert_close(td["goal_motion"][1, :, 0], torch.arange(1.0, 6.0))
 
 
+def test_reference_velocity_uses_current_reference_frame():
+  motion = motion_fixture()
+  motion.root_quat_w[3] = torch.tensor([2**-0.5, 0.0, 0.0, 2**-0.5])
+  motion.root_lin_vel_w[3] = torch.tensor([2.0, 0.0, 0.0])
+  velocity = motion_reference_base_lin_vel(motion, torch.tensor([3, 4]))
+  torch.testing.assert_close(velocity[0], torch.tensor([0.0, -2.0, 0.0]))
+  torch.testing.assert_close(velocity[1], torch.tensor([4.0, 1.0, 0.0]))
+
+
+@pytest.mark.parametrize("block", ["robot", "motion"])
+def test_critic_bootstrap_preserves_past_action_gradients(block):
+  wm = tracking_fixture(5, 5, "privileged_history")
+  wm.reset()
+  first = torch.ones(32, 29, requires_grad=True)
+  wm.step(first)
+  second = torch.ones(32, 29, requires_grad=True)
+  obs, _, _, _ = wm.step(second)
+  critic = torch.nn.Linear(obs["critic"].shape[-1], 1, bias=False)
+  with torch.no_grad():
+    critic.weight.zero_()
+    # Select only the penultimate history frame: the old privileged state and
+    # the current frame cannot provide an accidental gradient shortcut.
+    if block == "robot":
+      critic.weight[0, 920 + 3 * 93 : 920 + 3 * 93 + 64] = 1
+    else:
+      start = 920 + 5 * 93 + 3 * 64 + 58
+      critic.weight[0, start : start + 6] = 1
+  learner = ActorCriticPolicyLearner.__new__(ActorCriticPolicyLearner)
+  learner.critic = critic
+  learner.cfg = ActorCriticPolicyLearnerCfg(horizon=2)
+  learner._v_max = 1e6
+  value = learner._bootstrap(obs, torch.ones(32), torch.zeros(32))
+  grad_first, grad_second = torch.autograd.grad(value.sum(), (first, second))
+  assert torch.isfinite(grad_first).all() and grad_first.abs().sum() > 0
+  torch.testing.assert_close(grad_second, torch.zeros_like(second))
+  assert not critic.weight.requires_grad
+
+
+def test_critic_modes_config_and_resume_guard(tmp_path):
+  cfg, _, _, _ = actor_fixture()
+  raw = asdict(cfg)
+  del raw["critic_obs"]
+  assert load_runner_cfg({"runner_cfg": raw}).critic_obs == "legacy"
+  raw["critic_obs"] = "privileged_history"
+  restored = load_runner_cfg({"runner_cfg": raw})
+  assert restored.critic_obs == "privileged_history"
+  with pytest.raises(ValueError, match="privileged_history critic requires"):
+    SuperMimicRunnerCfg(critic_obs="privileged_history")
+  with pytest.raises(ValueError, match="active motion slot"):
+    SuperMimicRunnerCfg(
+      critic_obs="privileged_history",
+      tasks=restored.tasks,
+      slot_mix={"motion": 0.0, "velocity": 1.0},
+    )
+  checkpoint = tmp_path / "training_state.pt"
+  torch.save({"version": 1, "task_id": "test", "runner_cfg": asdict(cfg)}, checkpoint)
+  runner = SuperMimicRunner.__new__(SuperMimicRunner)
+  runner.cfg, runner.task_id, runner.device = restored, "test", "cpu"
+  runner.cfg.resume = str(checkpoint)
+  runner._motion_manifest = []
+  with pytest.raises(ValueError, match="Resume configuration mismatch: critic_obs"):
+    runner._load_training_state()
+
+
 def test_reset_sensor_padding_shares_current_noise():
   wm = TrackingHarness.__new__(TrackingHarness)
   wm.num_envs, wm.device = 2, "cpu"
@@ -291,6 +397,8 @@ def test_reset_sensor_padding_shares_current_noise():
 @pytest.mark.parametrize("mode", ["future_window", "causal_history"])
 def test_checkpoint_export_parity_and_legacy_config(tmp_path, mode):
   cfg, _, _, actor = actor_fixture(mode)
+  if mode == "causal_history":
+    cfg.critic_obs = "privileged_history"
   raw = asdict(cfg)
   if mode == "future_window":
     del raw["tasks"]["motion"]  # old runs did not serialize this field
@@ -310,6 +418,10 @@ def test_checkpoint_export_parity_and_legacy_config(tmp_path, mode):
   }
   control.update(
     robot="evt",
+    parameters={
+      "xml_path": "/old/allmimic/assets/robots/evt/urdf/evt2_simple.xml",
+      "mesh_dir": "/old/allmimic/assets/robots/evt/meshes",
+    },
     joint_names=[f"j{i}" for i in range(29)],
     control_dt=0.02,
     physics_dt=0.005,
@@ -326,6 +438,15 @@ def test_checkpoint_export_parity_and_legacy_config(tmp_path, mode):
   )
   model = onnx.load(tmp_path / "policy_motion.onnx")
   onnx.checker.check_model(model, full_check=True)
+  sidecar = json.loads((tmp_path / "policy_motion.json").read_text())
+  metadata = {p.key: p.value for p in model.metadata_props}
+  asset_paths = {
+    "xml_path": "assets/evt/urdf/evt2_simple.xml",
+    "mesh_dir": "assets/evt/meshes",
+  }
+  assert sidecar["robot_control"]["parameters"] == asset_paths
+  assert json.loads(metadata["robot_control"])["parameters"] == asset_paths
+  assert control["parameters"]["mesh_dir"].startswith("/old/")
   causal = mode == "causal_history"
   assert [x.name for x in model.graph.input] == [
     "history",

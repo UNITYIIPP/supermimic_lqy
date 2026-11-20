@@ -73,8 +73,10 @@ runners use the completed training iteration as the TensorBoard and W&B step.
 
 ## EVT training
 
-EVT uses the sibling asset `../allmimic/assets/robots/evt/urdf/evt2_simple.xml`
-and its mesh files. The source assets are read without modification. The robot's
+The EVT model and its STL meshes are packaged in `src/supermimic/assets/evt/`.
+Legacy checkpoints that point to the original default `allmimic` EVT paths
+use the packaged model. New control snapshots record paths relative to the
+`supermimic` package. The robot's
 embedded ground and actuators are replaced in memory by the tracking scene's
 ground and 29 native MuJoCo position PD actuators.
 
@@ -170,14 +172,46 @@ updates use the newest frame. The motion encoder consumes 320 normalized values
 and emits the existing 32D latent. The decoder consumes 465 robot-history values
 plus that latent (497 total) and emits 29 actions.
 
-The Critic keeps its original 917D input: MaxCoord state (214), privileged motion
-goal (670), and simulation context (33). Its ten reference samples are current
+By default the Critic keeps its original 917D input: MaxCoord state (214),
+privileged motion goal (670), and simulation context (33). Its ten reference samples are current
 through nine future frames, spaced five control steps apart (up to 900 ms).
 The dynamics network still receives state, action and simulation context without
 reference goals. Rewards, terminations and multistep optimization are unchanged.
 This is an asymmetric training setup: future targets guide training but are not
 actor inputs at deployment. The velocity task remains separately configured;
 its default centered smoothing is unchanged.
+
+To test a Critic that also observes the actor's histories, add
+`--runner.critic-obs privileged_history` to a **new causal training run**. For
+example, from the project directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 OMP_NUM_THREADS=1 \
+  uv run python -m supermimic.scripts.train SuperMimic-MaxCoord-EVT \
+  --motion-file /mnt/dataset/lqi3lr/dyh/supermimic/data/evt/walk1_subject1.npz \
+  --runner.actor-obs proprio --runner.history-length 10 \
+  --runner.tasks.motion.mode causal_history \
+  --runner.tasks.motion.history-length 10 \
+  --runner.critic-obs privileged_history --runner.run-name evt_critic_history10
+```
+
+The expanded Critic concatenates, in order: the original privileged input (917),
+current reference root linear velocity (3), flattened robot history (`93 * H`),
+and flattened causal reference history (`64 * G`). The velocity comes from the
+motion file at the current frame and is rotated into the **reference root's**
+frame, not the robot's frame. Both windows are exactly the actor's cached windows,
+including noise, reset padding and previous actions; no extra history buffer is
+allocated. The total is `920 + 93*H + 64*G`: 1705 for H=G=5, or 2490 for H=G=10.
+Future reference samples remain available to the Critic. This history expansion
+is a project-specific experiment, not a copy of DEX_MOSAIC's Critic history.
+
+This mode changes only Critic inputs and its first-layer width. Actor/ONNX inputs,
+Critic hidden widths, dynamics, reward, termination and rollout horizons retain
+their existing settings. Histories stay differentiable for the actor's value
+bootstrap. The mode is saved in configuration and checked when resuming; old
+configurations default to `legacy`. An old Critic/training-state checkpoint cannot
+be resumed into the expanded input layout. Use `--runner.critic-obs legacy` for
+the original Critic; resume an expanded-mode run with its matching configuration.
 
 The default remains `future_window`, so old configurations and checkpoints keep
 their original layout. Start a new causal run: an old actor/training-state

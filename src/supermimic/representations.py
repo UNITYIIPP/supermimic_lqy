@@ -220,6 +220,15 @@ def motion_goal_frame(
   )
 
 
+def motion_reference_base_lin_vel(
+  motion: MotionLoader, motion_times: torch.Tensor
+) -> torch.Tensor:
+  """Current file root velocity expressed in the reference root frame, (E, 3)."""
+  return quat_apply_inverse(
+    motion.root_quat_w[motion_times], motion.root_lin_vel_w[motion_times]
+  )
+
+
 def motion_anchor_window(
   motion: MotionLoader, motion_times: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:

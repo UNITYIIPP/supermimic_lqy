@@ -136,7 +136,8 @@ class Logger:
     )
 
     for key, value in losses.items():
-      log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
+      precision = ".6e" if key.startswith("LR/") else ".4f"
+      log_string += f"{f'{key}:':>{pad}} {value:{precision}}\n"
 
     for key, value in extras.items():
       label = f"{key}:" if "/" in key else f"Episode {key}:"

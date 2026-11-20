@@ -1,8 +1,10 @@
 """EVT tracking tasks; the original G1 environment factories stay unchanged."""
 
+from functools import partial
 from typing import cast
 
 import mjlab.envs.mdp as mdp
+import mujoco
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers import ObservationGroupCfg, ObservationTermCfg
@@ -18,6 +20,11 @@ from supermimic.robots.evt import (
   get_robot_cfg,
 )
 from supermimic.tasks import env_cfgs as obs
+
+
+def _set_ground_friction(spec: mujoco.MjSpec, sliding_friction: float) -> None:
+  # mjlab attaches the flat ground as a geom on the terrain body.
+  spec.geom("terrain").friction[0] = sliding_friction
 
 
 def gencoord_evt_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -39,7 +46,15 @@ def gencoord_evt_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   motion = cast(MotionCommandCfg, cfg.commands["motion"])
   motion.anchor_body_name = "pelvis"
   motion.body_names = TRACKED_BODIES
-  cfg.events["foot_friction"].params["asset_cfg"].geom_names = FOOT_GEOM_RE
+  # Keep the event name for the world model's single friction input. The foot
+  # pattern also supports older EVT XMLs without the collision suffix.
+  friction = cfg.events["foot_friction"].params
+  friction["asset_cfg"].geom_names = rf".*_collision$|{FOOT_GEOM_RE}"
+  if play:
+    friction["ranges"] = (1.0, 1.0)
+  cfg.scene.spec_fn = partial(
+    _set_ground_friction, sliding_friction=friction["ranges"][0]
+  )
   cfg.events["base_com"].params["asset_cfg"].body_names = ("waist_pitch_link",)
   cfg.events = {
     k: v

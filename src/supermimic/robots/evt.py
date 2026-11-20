@@ -34,9 +34,9 @@ TRACKED_BODIES = (
   "wrist_roll_r_link",
 )
 FOOT_GEOM_RE = r"^foot_(left|right)_.*$"
-_ASSET_DIR = (
-  Path(__file__).resolve().parents[4] / "allmimic" / "assets" / "robots" / "evt"
-)
+_PACKAGE_DIR = Path(__file__).resolve().parents[1]
+EVT_XML_PATH = Path("assets/evt/urdf/evt2_simple.xml")
+EVT_MESH_DIR = Path("assets/evt/meshes")
 
 
 @dataclass(frozen=True)
@@ -93,8 +93,8 @@ def default_joints() -> tuple[JointCfg, ...]:
 
 @dataclass(frozen=True)
 class EvtRobotCfg:
-  xml_path: Path = _ASSET_DIR / "urdf" / "evt2_simple.xml"
-  mesh_dir: Path = _ASSET_DIR / "meshes"
+  xml_path: Path = EVT_XML_PATH
+  mesh_dir: Path = EVT_MESH_DIR
   root_pos: tuple[float, float, float] = (0.0, 0.0, 0.95)
   soft_joint_pos_limit_factor: float = 0.9
   delay_min_lag: int = 0
@@ -136,12 +136,27 @@ class EvtEntityCfg(EntityCfg):
 
 def get_spec(cfg: EvtRobotCfg) -> mujoco.MjSpec:
   """Prepare a private MjSpec; never edit the source XML or mesh files."""
-  spec = mujoco.MjSpec.from_file(str(cfg.xml_path))
+  xml_path = (
+    _PACKAGE_DIR / EVT_XML_PATH
+    if cfg.xml_path == EVT_XML_PATH
+    else cfg.xml_path.expanduser().absolute()
+  )
+  mesh_dir = (
+    _PACKAGE_DIR / EVT_MESH_DIR
+    if cfg.mesh_dir == EVT_MESH_DIR
+    else cfg.mesh_dir.expanduser().absolute()
+  )
+  if not xml_path.is_file():
+    raise FileNotFoundError(f"EVT XML not found: {xml_path}")
+  spec = mujoco.MjSpec.from_file(str(xml_path))
   assets = {}
   for mesh in spec.meshes:
-    path = cfg.xml_path.parent / spec.meshdir / mesh.file
+    path = xml_path.parent / spec.meshdir / mesh.file
     if not path.is_file():
-      path = cfg.mesh_dir / Path(mesh.file).name
+      fallback = mesh_dir / Path(mesh.file).name
+      if not fallback.is_file():
+        raise FileNotFoundError(f"EVT mesh not found: {path} or {fallback}")
+      path = fallback
     assets[mesh.file] = path.read_bytes()
   spec.assets = assets
   for actuator in list(spec.actuators):

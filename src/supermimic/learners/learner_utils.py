@@ -208,6 +208,7 @@ class GradientStep:
     self.reducer = GradientReducer(self.params)
     self.clip_value = clip_value
     self.execution = execution
+    self._lr_changing = False
     self.captured = CapturedUpdate(
       self._backward, lambda: graph_state(self.modules, []), private_pool=True
     )
@@ -221,6 +222,17 @@ class GradientStep:
       ],
       private_pool=True,
     )
+
+  def set_learning_rate(self, lr: float, *, changing: bool) -> None:
+    # Muon uses a Python scalar, fixed at capture time. Delay capturing the
+    # optimizer graph until the schedule reaches its constant floor.
+    self._lr_changing = changing
+    for optimizer in self.optimizers:
+      for group in optimizer.param_groups:
+        if torch.is_tensor(group["lr"]):
+          group["lr"].fill_(lr)
+        else:
+          group["lr"] = lr
 
   def _backward(self, inputs: TensorDict) -> dict[str, torch.Tensor]:
     for opt in self.optimizers:
@@ -242,7 +254,7 @@ class GradientStep:
     self.reducer()
     result = (
       self._captured_optimizer(self._empty)
-      if self.execution == "split"
+      if self.execution == "split" and not self._lr_changing
       else self._finish(self._empty)
     )
     return {**outputs, **result}

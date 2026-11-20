@@ -83,6 +83,9 @@ class WorldModelLearner:
       lambda: graph_state([dynamics, representation], self.optimizers),
     )
 
+  def set_learning_rate(self, lr: float, *, changing: bool) -> None:
+    self._gradient_step.set_learning_rate(lr, changing=changing)
+
   def update_normalization(self, states: torch.Tensor, actions: torch.Tensor) -> None:
     """Update the dynamics state/action normalizers from fresh collected data.
 

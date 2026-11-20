@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from tensordict import TensorDict
 
 from supermimic.envs.world_model_env import WorldModelEnv
+from supermimic.representations import motion_reference_base_lin_vel
 from supermimic.tasks.task_spec import build_actor_obs_td
 from supermimic.utils.history import append_history
 
@@ -38,9 +39,15 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     history_length: int,
     termination_softness: float,
     device: str = "cpu",
+    critic_obs: Literal["legacy", "privileged_history"] = "legacy",
   ) -> None:
     self.task_specs = task_specs
     assert task_specs[0].name == "motion", "task_specs[0] must be the motion task"
+    if critic_obs not in ("legacy", "privileged_history"):
+      raise ValueError(f"Unknown critic observation mode: {critic_obs}")
+    if critic_obs == "privileged_history" and task_specs[0].history_length < 1:
+      raise ValueError("privileged_history critic requires causal motion history")
+    self.critic_obs = critic_obs
     super().__init__(
       dynamics=dynamics,
       representation=representation,
@@ -54,6 +61,10 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     )
 
   def _build_task_goals(self) -> None:
+    if self.critic_obs == "privileged_history":
+      self._reference_base_lin_vel = motion_reference_base_lin_vel(
+        self.motion, self.motion_times
+      )
     # The anchor task's goal is the actor goal already built in _update_goal; reuse it.
     anchor, *rest = self.task_specs
     self._task_goal_frames: dict[str, torch.Tensor] = {
@@ -97,6 +108,22 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
         if ts.history_length
         else frame
       )
+
+  def _critic_obs(self) -> torch.Tensor:
+    privileged = super()._critic_obs()
+    if self.critic_obs == "legacy":
+      return privileged
+    # Reuse the actor's cached windows, including noise/padding. Keep their
+    # graph: the actor bootstrap differentiates through the critic's inputs.
+    return torch.cat(
+      [
+        privileged,
+        self._reference_base_lin_vel,
+        self._sensor_history().flatten(1),
+        self._task_goal_obs["motion"].flatten(1),
+      ],
+      dim=-1,
+    )
 
   def get_observations(self) -> TensorDict:
     return build_actor_obs_td(

@@ -8,7 +8,7 @@
 
 ## 启动
 
-在 `supermimic_lqy` 中执行。EVT 模型需要同级 `../allmimic/assets/robots/evt`；本机已把 `../allmimic` 链接到 `/mnt/dataset/lqi3lr/dyh/allmimic`。动作数据通过 `--motion-file` 指定，支持引号包围的 glob。
+在 `supermimic_lqy` 中执行。EVT 本体和网格位于 `src/supermimic/assets/evt/`。动作数据通过 `--motion-file` 指定，支持引号包围的 glob。
 
 参数里的环境数和 batch size **均为每个进程的数量**；启动信息会打印 local/global 数量。不要向 torchrun 指定固定 `--device`。
 
@@ -40,6 +40,17 @@ uv run torchrun --standalone --nproc-per-node=4 \
 
 学习率不自动缩放，horizon、num_batches、replay_ratio 不随卡数改变。当前默认更新频率为 `num_envs * replay_ratio / (wm.num_batches * wm.batch_size * wm.horizon)`；环境数和 WM batch 同比拆分可以保持此频率。每卡加载完整动作库，采样 RNG 使用 `seed + 1000 * rank`，模型初始化使用独立 CPU 随机流（基础 seed、seed+1、seed+2 分别用于 WM、Actor、Critic），避免环境数量改变初始权重；参数随后由 rank 0 广播。
 
+在双卡、每卡 4096 个环境的配置中，可以为世界模型和 Actor/Critic 设置初始学习率 `2e-4 × √2`，并开启余弦衰减。
+
+```bash
+--runner.wm.lr 2.828427e-4 \
+--runner.policy.lr 2.828427e-4 \
+--runner.lr-decay-iterations 250000 \
+--runner.lr-min-ratio 0.03
+```
+
+调度按外层迭代号推进，同一迭代中的所有优化步骤使用该迭代的学习率。完成 25 万次外层迭代后，学习率固定在各自初始值的 3%。TensorBoard 的 `LR/world_model` 和 `LR/policy` 分别记录世界模型和 Actor/Critic 的学习率。`--runner.lr-decay-iterations 0`（默认）使用固定学习率。恢复训练时使用原学习率和调度配置，进度由 checkpoint 的迭代号恢复。
+
 本机 GPU 0/1 与 GPU 2/3 分别属于两个 NUMA 节点，无 NVLink。先用同节点双卡测量，再决定是否使用四卡。独立回放和浮点归约使多卡结果不会逐步等同单卡，需要用多个 seed 验证最终效果。
 
 ## 执行模式与同步
@@ -48,6 +59,8 @@ uv run torchrun --standalone --nproc-per-node=4 \
 - `eager`：不捕获外层更新；现有局部 `torch.compile` 仍启用，用于正确性参考。
 - `split`：每次优化步骤捕获前向/反向；图外执行梯度平均，再用独立 Graph 执行裁剪与 fused Adam/Muon 更新。各步骤使用独立 Graph 内存池，避免跨学习器重放覆盖仍存活的数据。
 - `full`：仅允许单卡且 profile=False，保留完整更新捕获路径。
+
+启用余弦衰减时，单卡完整更新模式切换到 `split`。`split` 保留前向和反向 Graph，衰减期间在图外更新优化器，达到固定学习率后再捕获优化器 Graph。这样 Muon 的浮点学习率会在每次更新中生效。
 
 默认每轮学习有 10 次 WM、1 次 Actor 和 20 次 Critic 优化，因此同步开销可能明显。当前 reducer 使用预分配连续缓冲区；梯度参与集合固定，未使用的 encoder 保持 `grad=None`，不会被优化器悄悄更新。所有卡在相同优化边界同步；若一张卡无有效回放窗口，所有卡共同跳过这次学习。
 
@@ -59,7 +72,9 @@ uv run torchrun --standalone --nproc-per-node=4 \
 
 只有 rank 0 写 TensorBoard/W&B、配置、checkpoint 和 ONNX。各卡参与指标归约：环境步数求和，loss/回报按计数汇总，阶段耗时取各卡最大值。日志 step 使用真实外层迭代号。
 
-每次保存仍输出 `world_model.pt`、`actor.pt`、可选 `critic.pt`，并新增原子替换的 `training_state.pt`，包含学习模型、优化器、共享采样器状态、迭代/更新/全局采样计数、训练配置及累计训练墙钟时间。
+默认每 5000 次外层训练迭代保存一次，可用 `--runner.save-interval` 调整；正常完成最后一次迭代时也会保存。每次保存仍输出 `world_model.pt`、`actor.pt`、可选 `critic.pt`，并原子替换 `training_state.pt`，包含学习模型、优化器、共享采样器状态、迭代/更新/全局采样计数、训练配置及累计训练墙钟时间。
+
+同时保留完整历史 checkpoint `training_state_5000.pt`、`training_state_10000.pt` 等，编号与日志中的迭代次数一致。历史文件先写入临时文件再原子重命名，不自动清理。`training_state.pt` 始终表示最近一次保存；ONNX 仍使用原有文件名保存最新版本，需要历史版本时可从对应 checkpoint 导出。
 
 恢复时使用原训练配置并增加：
 
@@ -110,7 +125,7 @@ uv run -m supermimic.scripts.evaluate_checkpoint \
   --num-envs 128 --steps 1000 --seed 1234
 ```
 
-这是无探索噪声、motion encoder 的固定预算评估，输出平均单步 reward、失败次数及每千环境步失败数，并附带 checkpoint 的训练时间和样本量。它不等同逐动作完成率；很短的评估可能尚未发生任何终止。默认追加到 `evaluations.jsonl`。若需保留多个历史点，应在下一次保存前复制 checkpoint，或及时评估原子更新后的 checkpoint。
+这是无探索噪声、motion encoder 的固定预算评估，输出平均单步 reward、失败次数及每千环境步失败数，并附带 checkpoint 的训练时间和样本量。它不等同逐动作完成率；很短的评估可能尚未发生任何终止。默认追加到 `evaluations.jsonl`。比较不同历史点时，将 `--checkpoint` 指向对应的 `training_state_<迭代次数>.pt`；`play --checkpoint` 和 `--runner.resume` 同样支持这些文件。
 
 最终应同时比较同样全局样本量下的效果，以及达到预设评估回报的墙钟时间，并重复多个 seed。短程 smoke/吞吐测试不能证明收敛质量相同。
 

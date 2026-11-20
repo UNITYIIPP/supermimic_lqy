@@ -20,7 +20,8 @@
 延迟范围当前为 `0～0` 个物理步，后续可在同一配置中启用。
 标称速度上限会保存和导出，本次没有新增硬速度限制或系统辨识随机化。
 
-资产来自 `../allmimic/assets/robots/evt/urdf/evt2_simple.xml` 和其 mesh 文件。
+EVT 本体 `evt2_simple.xml` 和引用的 STL 网格放在 `src/supermimic/assets/evt/`。
+旧 checkpoint 记录的默认 `allmimic` 资产路径会映射到这里。
 只在内存中移除原地面、原执行器与执行器禁用分组，再建立原生位置 PD。
 关节总力矩限制和执行器力矩限制均按新参数设置，避免旧 XML 限制继续截断力矩。
 质量、惯量、关节范围和被动阻尼、armature、frictionloss 使用原机械模型。

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
+import shutil
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -68,7 +70,7 @@ class BaseRunnerCfg:
   representation: str = "gencoord"  # "gencoord" or "maxcoord"
   actor_obs: str = "proprio"  # "rep_state" or "proprio"
   log_interval: int = 10
-  save_interval: int = 1000
+  save_interval: int = 5000
   execution: Execution = "auto"
   """auto: full graph on one GPU; split forward/backward graphs on multiple GPUs."""
   profile: bool = False
@@ -94,10 +96,17 @@ ActorCriticCfg = Annotated[
 @dataclass
 class SuperMimicRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 1000000
+  lr_decay_iterations: int = 0
+  """Outer iterations for cosine LR decay of all learners. 0 uses fixed rates."""
+  lr_min_ratio: float = 0.03
+  """Minimum learning rate as a fraction of each learner's initial rate."""
   replay_ratio: int = 16
   latent_dim: int = 32
   actor_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 256)
   critic_hidden_dims: tuple[int, ...] = (256, 128)
+  critic_obs: Literal["legacy", "privileged_history"] = "legacy"
+  """Optionally augment privileged state/future goals with actor histories and
+  current reference root linear velocity. Legacy preserves old checkpoints."""
   latent_bc_weight: float = 1e-1
   """Weight on the latent BC loss pulling non-anchor encoders toward the
   anchor encoder's latent on the same state. 0 disables."""
@@ -117,10 +126,25 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   return_sampler: ReturnSamplerCfg = field(default_factory=ReturnSamplerCfg)
 
   def __post_init__(self) -> None:
+    if self.lr_decay_iterations < 0:
+      raise ValueError("lr_decay_iterations must be nonnegative")
+    if not 0.0 <= self.lr_min_ratio <= 1.0:
+      raise ValueError("lr_min_ratio must be in [0, 1]")
     if self.history_length < 1:
       raise ValueError("Robot history length must be positive")
     if self.tasks.motion.mode == "causal_history" and self.actor_obs != "proprio":
       raise ValueError("causal_history requires actor_obs='proprio'")
+    if self.critic_obs not in ("legacy", "privileged_history"):
+      raise ValueError(f"Unknown critic observation mode: {self.critic_obs}")
+    if self.critic_obs == "privileged_history" and (
+      self.actor_obs != "proprio"
+      or self.tasks.motion.mode != "causal_history"
+      or self.slot_mix.get("motion", 0.0) <= 0.0
+    ):
+      raise ValueError(
+        "privileged_history critic requires actor_obs='proprio', "
+        "motion.mode='causal_history' and an active motion slot"
+      )
 
 
 @dataclass
@@ -303,7 +327,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self.model_seed = model_seed
     self.startup_seconds = 0.0
     self.training_wall_seconds = 0.0
-    self.execution: Execution = resolve_execution(cfg.execution, cfg.profile)
+    self.execution = self._resolve_execution()
 
     self._init_common()
     self._init_policy()
@@ -315,6 +339,9 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       device=device,
       wandb_enabled=cfg.wandb_enabled,
     )
+
+  def _resolve_execution(self) -> Execution:
+    return resolve_execution(self.cfg.execution, self.cfg.profile)
 
   def _init_common(self) -> None:
     wm = build_world_model(self.cfg, self.env, self.device, self.model_seed)
@@ -616,6 +643,35 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   only in what goal modality their encoder consumes.
   """
 
+  def _resolve_execution(self) -> Execution:
+    mode = super()._resolve_execution()
+    # Full graphs capture Muon's scalar learning rate together with the update.
+    if self.cfg.lr_decay_iterations and mode == "full":
+      return "split"
+    return mode
+
+  def _set_scheduled_learning_rates(self, step: int) -> dict[str, float]:
+    progress = min(step / self.cfg.lr_decay_iterations, 1.0)
+    floor = self.cfg.lr_min_ratio
+    scale = floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+    changing = progress < 1.0 and floor < 1.0
+    wm_lr = self.cfg.wm.lr * scale
+    policy_lr = self.cfg.policy.lr * scale
+    self.world_model_learner.set_learning_rate(wm_lr, changing=changing)
+    self.policy_learner.set_learning_rate(policy_lr, changing=changing)
+    return {"LR/world_model": wm_lr, "LR/policy": policy_lr}
+
+  def _policy_input_dims(self) -> tuple[int, int]:
+    actor_dim, critic_dim = super()._policy_input_dims()
+    if self.cfg.critic_obs == "privileged_history":
+      critic_dim += (
+        self._representation.proprio_obs_dim(self._num_actions)
+        * self.cfg.history_length
+        + (2 * self._num_actions + 6) * self.cfg.tasks.motion.history_length
+        + 3
+      )
+    return actor_dim, critic_dim
+
   def _init_policy(self) -> None:
     with distributed.model_initialization(
       self.model_seed + 1 if self.model_seed is not None else None
@@ -637,6 +693,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         if self.cfg.slot_mix.get(name, 0) > 0 and hi <= lo:
           raise ValueError(f"Local batch {size} leaves active task {name} empty")
     _, critic_input_dim = self._policy_input_dims()
+    print(
+      f"[INFO] Critic observations: {self.cfg.critic_obs}, input_dim={critic_input_dim}"
+    )
     with distributed.model_initialization(
       self.model_seed + 2 if self.model_seed is not None else None
     ):
@@ -658,6 +717,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       history_length=self.cfg.history_length,
       termination_softness=self.cfg.termination_softness,
       device=self.device,
+      critic_obs=self.cfg.critic_obs,
     )
     if torch.cuda.is_available():
       self.wm_env.step = torch.compile(self.wm_env.step)
@@ -762,6 +822,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     for key in (
       "representation",
       "actor_obs",
+      "critic_obs",
       "history_length",
       "slot_mix",
       "tasks",
@@ -769,6 +830,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       "return_sampler",
       "latent_bc_weight",
       "termination_softness",
+      "lr_decay_iterations",
+      "lr_min_ratio",
     ):
       if previous[key] != asdict(self.cfg)[key]:
         raise ValueError(f"Resume configuration mismatch: {key}")
@@ -932,7 +995,13 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     self, log_dir: Path, step: int, updates: int, collected: int
   ) -> None:
     if distributed.rank() == 0:
-      self._save_training_state(log_dir / "training_state.pt", step, updates, collected)
+      checkpoint_path = log_dir / "training_state.pt"
+      self._save_training_state(checkpoint_path, step, updates, collected)
+      # Preserve each saved iteration while keeping the latest checkpoint path.
+      archive_path = log_dir / f"training_state_{step + 1}.pt"
+      archive_tmp = archive_path.with_suffix(".tmp")
+      shutil.copyfile(checkpoint_path, archive_tmp)
+      os.replace(archive_tmp, archive_path)
       world_model_path = str(log_dir / "world_model.pt")
       actor_path = str(log_dir / "actor.pt")
       torch.save(self._wm.bundle(), world_model_path)
@@ -994,9 +1063,13 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       # Resume starts with an empty buffer; update scheduling restarts after warmup.
       num_collected_steps = 0
       wm_learn_time = policy_learn_time = collect_time = 0.0
-      loss_dict: dict[str, torch.Tensor] = {}
+      loss_dict: dict[str, float | torch.Tensor] = {}
       for step in range(first_step, self.cfg.max_iterations):
         iteration_start = time.perf_counter()
+        if self.cfg.lr_decay_iterations and (
+          step <= self.cfg.lr_decay_iterations or step == first_step
+        ):
+          loss_dict.update(self._set_scheduled_learning_rates(step))
         t0 = time.perf_counter()
         with timings.measure("collect"):
           collected = self.step()

@@ -96,6 +96,9 @@ class BpttPolicyLearner:
       cfg.grad_clip_value,
     )
 
+  def set_learning_rate(self, lr: float, *, changing: bool) -> None:
+    self._actor_step.set_learning_rate(lr, changing=changing)
+
   def update(self) -> dict[str, torch.Tensor]:
     self.actor.train()
     for module in (self.wm_env.dynamics, self.wm_env.representation):
@@ -219,6 +222,10 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       self._critic_loss, [critic], self.critic_optimizers, self.execution
     )
     self._v_max = self.wm_env.max_step_reward / (1 - self.cfg.gamma)
+
+  def set_learning_rate(self, lr: float, *, changing: bool) -> None:
+    super().set_learning_rate(lr, changing=changing)
+    self._critic_step.set_learning_rate(lr, changing=changing)
 
   def _bootstrap(
     self, obs: TensorDict, survival: torch.Tensor, term_prob: torch.Tensor

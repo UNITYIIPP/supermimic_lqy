@@ -3,11 +3,41 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import torch
 
-from supermimic.robots.evt import EvtEntityCfg, EvtRobotCfg, JointCfg
+from supermimic.robots.evt import (
+  EVT_MESH_DIR,
+  EVT_XML_PATH,
+  EvtEntityCfg,
+  EvtRobotCfg,
+  JointCfg,
+)
+
+
+def portable_control_snapshot(snapshot: dict) -> dict:
+  """Use the packaged model when a snapshot names the original EVT asset pair."""
+  parameters = snapshot.get("parameters")
+  if snapshot.get("robot") != "evt" or not parameters:
+    return snapshot
+  xml_path = PurePosixPath(str(parameters.get("xml_path", "")).replace("\\", "/"))
+  mesh_dir = PurePosixPath(str(parameters.get("mesh_dir", "")).replace("\\", "/"))
+  legacy_root = xml_path.parent.parent
+  if (
+    legacy_root.parts[-4:] == ("allmimic", "assets", "robots", "evt")
+    and xml_path == legacy_root / "urdf" / EVT_XML_PATH.name
+    and mesh_dir == legacy_root / EVT_MESH_DIR.name
+  ):
+    return {
+      **snapshot,
+      "parameters": {
+        **parameters,
+        "xml_path": EVT_XML_PATH.as_posix(),
+        "mesh_dir": EVT_MESH_DIR.as_posix(),
+      },
+    }
+  return snapshot
 
 
 def control_snapshot(env) -> dict | None:
@@ -38,9 +68,9 @@ def control_snapshot(env) -> dict | None:
   scale = row(action.scale)
   offset = row(action.offset)
   parameters = asdict(cfg.parameters)
-  parameters["xml_path"] = str(parameters["xml_path"])
-  parameters["mesh_dir"] = str(parameters["mesh_dir"])
-  return {
+  parameters["xml_path"] = parameters["xml_path"].as_posix()
+  parameters["mesh_dir"] = parameters["mesh_dir"].as_posix()
+  snapshot = {
     "robot": "evt",
     "parameters": parameters,
     "joint_names": names,
@@ -57,6 +87,7 @@ def control_snapshot(env) -> dict | None:
     "delay_min_lag": cfg.parameters.delay_min_lag,
     "delay_max_lag": cfg.parameters.delay_max_lag,
   }
+  return portable_control_snapshot(snapshot)
 
 
 def restore_control(env_cfg, snapshot: dict | None) -> None:
@@ -68,7 +99,7 @@ def restore_control(env_cfg, snapshot: dict | None) -> None:
     raise ValueError("Robot task does not match the run's control snapshot")
   from supermimic.tasks.evt_env_cfgs import configure_robot
 
-  raw = dict(snapshot["parameters"])
+  raw = dict(portable_control_snapshot(snapshot)["parameters"])
   raw["xml_path"] = Path(raw["xml_path"])
   raw["mesh_dir"] = Path(raw["mesh_dir"])
   raw["root_pos"] = tuple(raw["root_pos"])

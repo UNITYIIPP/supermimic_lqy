@@ -17,6 +17,7 @@ from supermimic.representations import (
   NUM_GOAL_FRAMES,
   create_representation,
 )
+from supermimic.robots.control import portable_control_snapshot
 from supermimic.runners.exporter import _export_module
 from supermimic.tasks.task_spec import resolve_task_specs
 
@@ -67,7 +68,7 @@ def _validate_control(control: dict | None, task_id: str) -> dict:
   for key in ("control_dt", "physics_dt"):
     if not math.isfinite(control[key]) or control[key] <= 0:
       raise ValueError(f"Invalid control snapshot field: {key}")
-  return control
+  return portable_control_snapshot(control)
 
 
 def _history_terms(mode: str, representation: str, joints: int, bodies: int) -> dict:
