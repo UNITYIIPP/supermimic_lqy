@@ -96,7 +96,9 @@ class _SingleEncoderOnnx(nn.Module):
     self.history_length = actor.history_length
     self.hist_size = actor.history_length * actor.obs_dim
     self.term_widths = term_widths
-    self.goal_dim = next(ts for ts in actor.task_specs if ts.name == task_name).goal_dim
+    spec = next(ts for ts in actor.task_specs if ts.name == task_name)
+    self.goal_dim = spec.goal_dim
+    self.causal_goal = spec.causal_command_history
     self.input_size = self.hist_size + self.goal_dim
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -104,6 +106,12 @@ class _SingleEncoderOnnx(nn.Module):
       x[..., : self.hist_size], self.term_widths, self.history_length
     )
     goal = x[..., self.hist_size :]
+    if self.causal_goal:
+      # Deployment stacks the command and rotation terms independently.
+      frame_width = self.goal_dim // self.history_length
+      goal = term_major_to_temporal(
+        goal, [frame_width - 6, 6], self.history_length
+      ).flatten(1)
     history_n = self.obs_normalizer(history)
     z = torch.tanh(self.encoder(self.goal_normalizer(goal)))
     return self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
@@ -241,9 +249,10 @@ def _export_motion(
     if n != "motion_anchor_pos_b"
   ]
   metadata["observation_names"] = actor_terms + actor_goal_names
+  goal_history_length = actor.history_length if wrapper.actor.causal_goal else 1
   metadata["observation_history_lengths"] = [actor.history_length] * len(
     actor_terms
-  ) + [1] * len(actor_goal_names)
+  ) + [goal_history_length] * len(actor_goal_names)
   attach_metadata_to_onnx(onnx_path, metadata)
 
 

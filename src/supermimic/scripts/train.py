@@ -11,12 +11,14 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.tasks.registry import list_tasks, load_env_cfg
 
 import supermimic.tasks  # noqa: F401
+from supermimic import causal_observations as causal
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
 from supermimic.scripts.train_utils import (
   create_env,
   download_registry_motions,
   setup_device,
 )
+from supermimic.tasks.evt_env_cfgs import configure_observation_layout
 
 
 @dataclass
@@ -33,9 +35,14 @@ class TrainConfig:
   @staticmethod
   def from_task(task_id: str) -> "TrainConfig":
     env_cfg = load_env_cfg(task_id, play=False)
+    runner = SuperMimicRunnerCfg()
+    if task_id == "SuperMimic-GenCoord-EVT":
+      runner.observation_layout = causal.GRAVITY_LAYOUT
+      runner.actor_obs = "proprio"
+      runner.history_length = causal.HISTORY
     return TrainConfig(
       env=env_cfg,
-      runner=SuperMimicRunnerCfg(),
+      runner=runner,
       registry_name=None if task_id.endswith("-EVT") else TrainConfig.registry_name,
     )
 
@@ -89,6 +96,7 @@ def main() -> None:
     "external" if args.runner.sampling_mode == "return" else args.runner.sampling_mode
   )
 
+  configure_observation_layout(chosen_task, args.env, args.runner)
   env = create_env(args.env, args.num_envs, device)
 
   # Init Runner

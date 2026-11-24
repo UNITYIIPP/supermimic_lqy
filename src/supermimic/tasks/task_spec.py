@@ -17,6 +17,7 @@ import torch
 from mjlab.utils.lab_api.math import quat_apply_inverse
 from tensordict import TensorDict
 
+from supermimic import causal_observations as causal
 from supermimic.representations import actor_goal_dim
 
 if TYPE_CHECKING:
@@ -66,6 +67,7 @@ class TaskSpec:
   precompute_replay_goal: PrecomputeReplayGoal | None = None
   """Optional noise-free per-frame command table for ONNX-export sanity
   checks and viewer replay mode. Returns shape ``(num_frames, raw_goal_dim)``."""
+  causal_command_history: bool = False
 
 
 def build_actor_obs_td(
@@ -86,12 +88,18 @@ def make_motion_task(representation: "StateRepresentation", num_goals: int) -> T
   """Motion-tracking task: goal is the full motion target (actor side)."""
 
   def extract(motion, motion_times, aux_state):
+    if representation.causal_motion:
+      # times and poses are the paired, causal replay window.
+      return causal.motion_frame(motion, motion_times, aux_state[..., 3:7]).flatten(1)
     _, actor_goal = representation.compute_wm_goal(motion, motion_times, aux_state)
     return actor_goal
 
   return TaskSpec(
     name="motion",
-    goal_dim=actor_goal_dim(num_goals),
+    causal_command_history=representation.causal_motion,
+    goal_dim=causal.HISTORY * num_goals
+    if representation.causal_motion
+    else actor_goal_dim(num_goals),
     extract_training_goal=extract,
   )
 

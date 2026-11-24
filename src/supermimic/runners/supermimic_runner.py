@@ -15,6 +15,7 @@ import wandb
 from rsl_rl.models import MLPModel
 from tensordict import TensorDict
 
+from supermimic import causal_observations as causal
 from supermimic.envs.motion_tracking_env import MotionTrackingEnv
 from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
 from supermimic.learners.policy_learner import (
@@ -55,6 +56,9 @@ class BaseRunnerCfg:
   buffer_size: int = 1000
   representation: str = "gencoord"  # "gencoord" or "maxcoord"
   actor_obs: str = "rep_state"  # "rep_state" or "proprio"
+  observation_layout: Literal["legacy", "evt_causal_v2", "evt_causal_v2_gravity"] = (
+    "legacy"
+  )
   log_interval: int = 10
   save_interval: int = 1000
   history_length: int = 1
@@ -162,6 +166,7 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     env.unwrapped.cfg.decimation,
     default_joint_pos,
     actor_obs_mode=cfg.actor_obs,
+    observation_layout=cfg.observation_layout,
   ).to(device)
 
   representation.bind(env.unwrapped, sim_context)
@@ -309,9 +314,10 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     """Seed the real-sim obs-history ring with the noised current sensor."""
     if self.cfg.history_length == 1:
       return
-    seed = self._representation.add_proprio_noise(
-      self.env.get_observations()["actor"].to(self.device)
-    )
+    obs = self.env.get_observations()
+    if self._representation.causal_motion:
+      self._command_history = causal.advance_history(None, obs["goal"])
+    seed = self._representation.add_proprio_noise(obs["actor"].to(self.device))
     self._sim_history = seed.unsqueeze(1).repeat(1, self.cfg.history_length, 1)
 
   def _collection_history(self, sensor: torch.Tensor) -> torch.Tensor:
@@ -343,6 +349,20 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       + self._num_goals
       + self._sim_context.output_dim
     )
+    if self._representation.causal_motion:
+      # Shared policy history + current GenCoord + tracked poses + current
+      # reference translation + DR context + future full reference frames.
+      critic_state_dim = self._representation.rep_state_dim
+      if not self._representation.uses_projected_gravity:
+        critic_state_dim -= 3
+      critic_dim = (
+        actor_dim
+        + critic_state_dim
+        + 9 * len(self.motion_cmd.cfg.body_names)
+        + 3
+        + self._sim_context.output_dim
+        + causal.FUTURE * (self._num_goals + 3)
+      )
     return actor_dim, critic_dim
 
   def _build_mlp(
@@ -579,6 +599,11 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     motion_times: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> TensorDict:
+    if self._representation.causal_motion:
+      assert self._sim_history is not None
+      return build_actor_obs_td(
+        {"motion": self._command_history.flatten(1)}, self._sim_history
+      )
     proprio = self.cfg.actor_obs == "proprio"
     sensor = self._representation.compute_actor_sensor(
       rep_state,
@@ -646,6 +671,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         extra_fields=extra_fields,
       )
       self._advance_sim_history(next_obs["actor"].to(self.device), dones)
+      if self._representation.causal_motion:
+        self._command_history = causal.advance_history(
+          self._command_history, next_obs["goal"], dones
+        )
       terminated = self.env.unwrapped.termination_manager.terminated
       self.logger.process_env_step(rewards, terminated, extras)
 

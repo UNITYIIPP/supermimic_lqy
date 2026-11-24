@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from tensordict import TensorDict
 
+from supermimic import causal_observations as causal
 from supermimic.replay_buffer import ReplayBuffer
 
 if TYPE_CHECKING:
@@ -158,6 +159,26 @@ class WorldModelEnv(ABC):
 
   def _critic_obs(self) -> torch.Tensor:
     """The privileged critic input — full WM state, not the actor's sensor obs."""
+    if self.representation.causal_motion:
+      offset, future = causal.privileged_reference(
+        self.motion, self.motion_times, self.aux_state
+      )
+      current_state = self.rep_state
+      if not self.representation.uses_projected_gravity:
+        # Keep the root height, drop only the three gravity components.
+        current_state = torch.cat((current_state[:, :1], current_state[:, 4:]), -1)
+      return torch.cat(
+        (
+          self._sensor_history().flatten(1),
+          self._actor_goal_obs,
+          current_state,
+          self.representation.pelvis_body_poses(self.rep_state),
+          offset,
+          self.sim_ctx,
+          future,
+        ),
+        -1,
+      )
     return torch.cat([self.rep_state, self._wm_goal_obs, self.sim_ctx], dim=-1)
 
   def _wm_step(
@@ -221,12 +242,21 @@ class WorldModelEnv(ABC):
   def _on_reset(self, batch: TensorDict) -> None:
     """Seed motion times from the sampled batch and refresh goals."""
     self.motion_times = batch["motion_time"]
-    self._update_goal()
+    if self.representation.causal_motion:
+      self._command_history = batch["command_window"]
+    self._update_goal(reset=True)
     if self.history_length > 1:
       self._past_sensors = self._warmstart_past_sensors(
         batch["sensor_window"], batch["pad_mask"]
       )
     self._latest_sensor = self._synth_sensor()
+    if self.representation.causal_motion:
+      # With zero real predecessors, repeat the current simulated sensor/noise.
+      self._past_sensors = torch.where(
+        batch["pad_mask"][:, -2, None, None],
+        self._latest_sensor[:, None],
+        self._past_sensors,
+      )
 
   def _compute_commands(self) -> None:
     """Advance the reference clip one frame (clamped at clip ends) and refresh."""
@@ -238,12 +268,20 @@ class WorldModelEnv(ABC):
     self.motion_times = torch.where(at_end, self.motion_times, next_motion_times)
     self._update_goal()
 
-  def _update_goal(self) -> None:
+  def _update_goal(self, reset: bool = False) -> None:
     """Compute the reference body state at ``motion_times`` and rebuild goals."""
     self._ref_body_state = self.motion.body_state(self.motion_times)
-    self._wm_goal_obs, self._actor_goal_obs = self.representation.compute_wm_goal(
-      self.motion, self.motion_times, self.aux_state
-    )
+    if self.representation.causal_motion:
+      if not reset:
+        frame = causal.motion_frame(
+          self.motion, self.motion_times, self.aux_state[:, 3:7]
+        )
+        self._command_history = causal.advance_history(self._command_history, frame)
+      self._actor_goal_obs = self._command_history.flatten(1)
+    else:
+      self._wm_goal_obs, self._actor_goal_obs = self.representation.compute_wm_goal(
+        self.motion, self.motion_times, self.aux_state
+      )
     self._build_task_goals()
 
   # ------------------------------------------------------------------
@@ -264,6 +302,10 @@ class WorldModelEnv(ABC):
       self.history_length, self.num_envs
     )
     batch = window[:, -1]
+    if self.representation.causal_motion:
+      batch["command_window"] = causal.motion_frame(
+        self.motion, window["motion_time"], window["state"][..., 3:7]
+      )
     batch["sensor_window"] = window["actor_obs"]
     batch["pad_mask"] = padded
     return batch

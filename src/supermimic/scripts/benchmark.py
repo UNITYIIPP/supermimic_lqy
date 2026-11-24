@@ -14,10 +14,12 @@ from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
+from supermimic import causal_observations as causal
 from supermimic.representations import extract_actor_goal
 from supermimic.robots.control import restore_control
 from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
 from supermimic.runners.supermimic_runner import build_actor, build_world_model
+from supermimic.tasks.evt_env_cfgs import configure_observation_layout
 from supermimic.tasks.task_spec import build_actor_obs_td
 from supermimic.utils.wandb_artifacts import (
   download_artifact_cached,
@@ -78,6 +80,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
     wm = None  # set by stage 1; None means it failed before building.
     try:
       env_cfg = load_env_cfg(cfg.task_id, play=True)
+      configure_observation_layout(cfg.task_id, env_cfg, runner_cfg)
       restore_control(env_cfg, bundle.get("robot_control"))
       env_cfg.scene.num_envs = n_envs
 
@@ -104,6 +107,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
         actions = torch.rand((n_envs, wm.num_actions), device=device) * 2 - 1
 
       obs, _ = env.reset()
+      history = commands = dones = None
 
       # Sync CUDA
       if "cuda" in device:
@@ -119,14 +123,17 @@ def benchmark(cfg: BenchmarkConfig) -> None:
               sim_ctx,
               sim_actor_obs=obs["actor"] if runner_cfg.actor_obs == "proprio" else None,
             )
-            # Only the shape matters for timing; pad like training does at reset.
-            history = sensor.unsqueeze(1).repeat(1, runner_cfg.history_length, 1)
-            actor_obs = build_actor_obs_td(
-              {"motion": extract_actor_goal(obs["goal"])}, history
-            )
+            if representation.causal_motion:
+              history = causal.advance_history(history, sensor, dones)
+              commands = causal.advance_history(commands, obs["goal"], dones)
+              goal = commands.flatten(1)
+            else:
+              history = sensor.unsqueeze(1).repeat(1, runner_cfg.history_length, 1)
+              goal = extract_actor_goal(obs["goal"])
+            actor_obs = build_actor_obs_td({"motion": goal}, history)
             actions = policy(actor_obs)
 
-          obs, _, _, _ = env.step(actions)
+          obs, _, dones, _ = env.step(actions)
 
       if "cuda" in device:
         torch.cuda.synchronize()

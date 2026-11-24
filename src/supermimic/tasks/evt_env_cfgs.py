@@ -7,9 +7,11 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers import ObservationGroupCfg, ObservationTermCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
+from mjlab.tasks.tracking import mdp as tracking_mdp
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
 
+from supermimic import causal_observations as causal
 from supermimic.robots.evt import (
   FOOT_GEOM_RE,
   TRACKED_BODIES,
@@ -18,6 +20,32 @@ from supermimic.robots.evt import (
   get_robot_cfg,
 )
 from supermimic.tasks import env_cfgs as obs
+
+
+def configure_observation_layout(task_id, env_cfg, runner_cfg):
+  if runner_cfg.observation_layout == "legacy":
+    return
+  if (
+    task_id != "SuperMimic-GenCoord-EVT"
+    or runner_cfg.actor_obs != "proprio"
+    or runner_cfg.representation != "gencoord"
+    or runner_cfg.history_length != causal.HISTORY
+    or runner_cfg.slot_mix.get("motion") != 1.0
+  ):
+    raise ValueError(
+      f"{runner_cfg.observation_layout} requires GenCoord-EVT, proprio, "
+      "five history frames and motion-only slots"
+    )
+  if runner_cfg.observation_layout == causal.LAYOUT:
+    env_cfg.observations["actor"].terms.pop("projected_gravity")
+  env_cfg.observations["goal"].terms = {
+    "command": ObservationTermCfg(
+      func=mdp.generated_commands, params={"command_name": "motion"}
+    ),
+    "motion_anchor_ori_b": ObservationTermCfg(
+      func=tracking_mdp.motion_anchor_ori_b, params={"command_name": "motion"}
+    ),
+  }
 
 
 def gencoord_evt_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:

@@ -30,6 +30,7 @@ from supermimic.scripts.viewers import (
   SuperMimicViserViewer,
   create_wm_vis_model,
 )
+from supermimic.tasks.evt_env_cfgs import configure_observation_layout
 from supermimic.utils.wandb_artifacts import (
   download_artifact_cached,
   download_model_dir,
@@ -97,6 +98,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   run = wandb.Api().run(cfg.wandb_path)
   runner_cfg = load_runner_cfg(run.config)
   check_representation_matches(task_id, runner_cfg.representation)
+  configure_observation_layout(task_id, env_cfg, runner_cfg)
   model_dir = download_model_dir(run)
   bundle = torch.load(
     model_dir / "world_model.pt",

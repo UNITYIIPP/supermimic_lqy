@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from mjlab.viewer import BaseViewer, NativeMujocoViewer, ViserPlayViewer
 
+from supermimic import causal_observations as causal
 from supermimic.models import Dynamics
 from supermimic.representations import (
   MaxCoordRepresentation,
@@ -88,10 +89,7 @@ class SuperMimicViewerMixin:
       adr = mj_model.joint(free_joint_id).qposadr[0]
       self.free_joint_q_adr = np.arange(adr, adr + 7)
 
-    self.step_in_rollout = 0
-    self.curr_pred_rep_state = None
-    self.curr_wm_aux = None
-    self.last_actions: torch.Tensor | None = None
+    self.reset_env_supermimic()
 
     # For per-body tracking: map entity-local body indexes to MuJoCo body IDs
     if isinstance(self.representation, MaxCoordRepresentation):
@@ -105,6 +103,10 @@ class SuperMimicViewerMixin:
     self.curr_pred_rep_state = None
     self.curr_wm_aux = None
     self.last_actions = None
+    self._gt_history = None
+    self._wm_history = None
+    self._gt_command_history = None
+    self._wm_command_history = None
 
   def set_task(self, name: str) -> None:
     """Switch the active task. Reroutes the actor through that task's encoder."""
@@ -142,7 +144,11 @@ class SuperMimicViewerMixin:
     precomputed motion-derived command at the current motion time.
     """
     if self.current_task == "motion":
-      return extract_actor_goal(curr_goals)
+      return (
+        curr_goals
+        if self.representation.causal_motion
+        else extract_actor_goal(curr_goals)
+      )
     ts = self.task_specs[self.current_task]
     if self._replay_mode.get(self.current_task, False):
       motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
@@ -290,8 +296,10 @@ class SuperMimicViewerMixin:
           self.curr_wm_aux = self.representation.extract_aux_state(curr_gt_states)
           self.curr_pred_rep_state = self.representation.represent(curr_gt_states)
           self.sim_ctx = self.sim_context.read(self.env.unwrapped)
-          self._gt_history = None
+          if not self.representation.causal_motion:
+            self._gt_history = None
           self._wm_history = None
+          self._wm_command_history = None
 
         if self.last_actions is None:
           self.last_actions = torch.zeros(
@@ -300,6 +308,11 @@ class SuperMimicViewerMixin:
 
         # Actor step on ground-truth obs.
         gt_aux = self.representation.extract_aux_state(curr_gt_states)
+        if self.representation.causal_motion:
+          self._gt_command_history = causal.advance_history(
+            self._gt_command_history, curr_goals
+          )
+          curr_goals = self._gt_command_history.flatten(1)
         actor_goal = self._build_actor_goal(curr_goals, gt_aux)
         gt_rep_state = self.representation.represent(curr_gt_states)
         proprio = self.representation.actor_obs_mode == "proprio"
@@ -320,11 +333,20 @@ class SuperMimicViewerMixin:
         self._stats_steps += 1
 
         # Predict Next State (WM)
-        wm_goal, _ = self.representation.compute_wm_goal(
-          motion_cmd.motion,
-          wm_motion_times,
-          self.curr_wm_aux,
-        )
+        if self.representation.causal_motion:
+          wm_command = causal.motion_frame(
+            motion_cmd.motion, wm_motion_times, self.curr_wm_aux[:, 3:7]
+          )
+          self._wm_command_history = causal.advance_history(
+            self._wm_command_history, wm_command
+          )
+          wm_goal = self._wm_command_history.flatten(1)
+        else:
+          wm_goal, _ = self.representation.compute_wm_goal(
+            motion_cmd.motion,
+            wm_motion_times,
+            self.curr_wm_aux,
+          )
 
         # Closed-loop actor step on the WM-predicted state.
         wm_actor_goal = self._build_actor_goal(wm_goal, self.curr_wm_aux)

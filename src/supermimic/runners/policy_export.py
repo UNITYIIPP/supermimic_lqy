@@ -11,6 +11,7 @@ import onnx
 import torch
 from torch import nn
 
+from supermimic import causal_observations as causal
 from supermimic.models import MultiEncoderAE
 from supermimic.representations import (
   GOAL_FRAME_STRIDE,
@@ -129,17 +130,23 @@ def export_policy_checkpoint(
     round(control["control_dt"] / control["physics_dt"]),
     torch.tensor(control["default_joint_pos"]),
     cfg.actor_obs,
+    cfg.observation_layout,
   )
   terms = _history_terms(cfg.actor_obs, cfg.representation, joints, bodies)
+  if not representation.uses_projected_gravity:
+    terms.pop("projected_gravity")
   goal_dim = state_dict["goal_normalizers.motion._mean"].numel()
-  if goal_dim != NUM_GOAL_FRAMES * (2 * joints + 6):
+  goal_frame_dim = 2 * joints + 6
+  goal_frames = causal.HISTORY if representation.causal_motion else NUM_GOAL_FRAMES
+  if goal_dim != goal_frames * goal_frame_dim:
     raise ValueError("Checkpoint motion goal differs from the current goal layout")
+  num_goals = (
+    goal_frame_dim if representation.causal_motion else goal_dim + GOAL_REL_POS_DIM
+  )
   actor = MultiEncoderAE(
     obs_dim=sum(terms.values()),
     action_dim=joints,
-    task_specs=resolve_task_specs(
-      cfg.tasks, representation, goal_dim + GOAL_REL_POS_DIM
-    ),
+    task_specs=resolve_task_specs(cfg.tasks, representation, num_goals),
     slot_mix=cfg.slot_mix,
     latent_dim=cfg.latent_dim,
     hidden_dims=cfg.actor_hidden_dims,
@@ -164,7 +171,7 @@ def export_policy_checkpoint(
         f"[WARN] '{spec.name}' had zero training slots; this encoder may be untrained."
       )
     contract = {
-      "schema_version": 1,
+      "schema_version": 2 if representation.causal_motion else 1,
       "format": "supermimic_policy_external_goal",
       "run_path": run_path,
       "task_id": task_id,
@@ -185,7 +192,11 @@ def export_policy_checkpoint(
       "body_names": body_names,
       "robot_control": control,
     }
-    if spec.name == "motion":
+    if representation.causal_motion:
+      contract["observation_layout"] = cfg.observation_layout
+    if spec.causal_command_history:
+      contract["goal_layout"] = causal.goal_contract()
+    elif spec.name == "motion":
       contract["goal_layout"] = {
         "order": "flatten([joint_pos, joint_vel] per frame), then flatten(relative_anchor_rot6d per frame)",
         "frames": NUM_GOAL_FRAMES,

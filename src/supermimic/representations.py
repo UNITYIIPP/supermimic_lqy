@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
   from supermimic.sim_context import SimContext
 
+from supermimic import causal_observations as causal
 from supermimic.utils.analytic_ik import AnalyticIK
 from supermimic.utils.gencoord_helpers import (
   compute_gencoord_state,
@@ -61,6 +62,7 @@ def create_representation(
   decimation: int,
   default_joint_pos: torch.Tensor,
   actor_obs_mode: str,
+  observation_layout: str = "legacy",
 ) -> StateRepresentation:
   """Create a state representation wired up for training and reward compute."""
   if name == "gencoord":
@@ -76,6 +78,10 @@ def create_representation(
     raise ValueError(
       f"Unknown representation: {name}. Must be 'gencoord' or 'maxcoord'."
     )
+  rep.causal_motion = observation_layout in (causal.LAYOUT, causal.GRAVITY_LAYOUT)
+  rep.uses_projected_gravity = observation_layout != causal.LAYOUT
+  if rep.causal_motion and (name != "gencoord" or actor_obs_mode != "proprio"):
+    raise ValueError("Causal EVT policies require GenCoord proprio observations")
   rep.actor_obs_mode = actor_obs_mode
   if actor_obs_mode == "proprio":
     rep.register_buffer(
@@ -250,6 +256,8 @@ class StateRepresentation(nn.Module, ABC):
     LOSS_WEIGHT_CONFIG: dict[str, str]
   """
 
+  causal_motion: bool = False
+  uses_projected_gravity: bool = True
   full_state_dim: int
   rep_state_dim: int
   prediction_dim: int
@@ -326,14 +334,19 @@ class StateRepresentation(nn.Module, ABC):
   def proprio_term_widths(self, num_actions: int) -> list[int]:
     """Widths of ``[projected_gravity, base_ang_vel, joint_pos, joint_vel, actions]``,
     the sensor proprio in the order ``_sensor_actor_group`` concatenates it."""
-    return [3, 3, self.num_joints, self.num_joints, num_actions]
+    widths = [3, self.num_joints, self.num_joints, num_actions]
+    return [3, *widths] if self.uses_projected_gravity else widths
 
   def proprio_noise_bounds(
     self, num_actions: int, device: torch.device | str
   ) -> torch.Tensor:
     """Per-dim uniform-noise half-widths matching the sensor proprio layout."""
     widths = self.proprio_term_widths(num_actions)
-    halves = PROPRIO_NOISE_HALF_WIDTHS.values()
+    halves = [
+      h
+      for name, h in PROPRIO_NOISE_HALF_WIDTHS.items()
+      if self.uses_projected_gravity or name != "projected_gravity"
+    ]
     return torch.cat(
       [torch.full((w,), h, device=device) for w, h in zip(widths, halves, strict=True)]
     )
@@ -346,7 +359,10 @@ class StateRepresentation(nn.Module, ABC):
       if self.actor_obs_mode == "rep_state"
       else self.proprio_obs_dim(num_actions)
     )
-    return history_length * sensor_or_state + actor_goal_dim(num_goals)
+    goal_dim = (
+      causal.HISTORY * num_goals if self.causal_motion else actor_goal_dim(num_goals)
+    )
+    return history_length * sensor_or_state + goal_dim
 
   def add_proprio_noise(self, obs: torch.Tensor) -> torch.Tensor:
     """Add per-dim uniform proprio jitter — the single noise site shared by the
@@ -489,10 +505,14 @@ class GenCoordRepresentation(StateRepresentation):
     self.prediction_dim = 6 + num_joints  # [Δv_b(3), Δw_b(3), Δvj(N)]
     self._default_joint_pos = default_joint_pos
     self.fk: ForwardKinematics  # set by bind
+    self._encoder_bias: tuple[slice, SimContext] | None = None
 
   def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
     super().bind(env, sim_context)
     self.fk = env.command_manager.get_term("motion").motion.fk
+    if self.causal_motion:
+      columns = sim_context.find("encoder_bias")
+      self._encoder_bias = None if columns is None else (columns, sim_context)
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
     flat = full_state.reshape(-1, self.full_state_dim)
@@ -603,10 +623,23 @@ class GenCoordRepresentation(StateRepresentation):
     joint_state: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
-    del aux_state, sim_ctx
+    del aux_state
     _, g_b, _, w_b, _, _ = decompose_rep_state(rep_state)
     qj, vj = joint_state.chunk(2, dim=-1)
-    return torch.cat([g_b, w_b, qj - self._default_joint_pos, vj], dim=-1)
+    joint_pos_rel = qj - self._default_joint_pos
+    if self._encoder_bias is not None:
+      columns, context = self._encoder_bias
+      joint_pos_rel = joint_pos_rel + context.denormalize(sim_ctx, columns)
+    terms = [w_b, joint_pos_rel, vj]
+    return torch.cat([g_b, *terms] if self.uses_projected_gravity else terms, dim=-1)
+
+  def pelvis_body_poses(self, rep_state: torch.Tensor) -> torch.Tensor:
+    """FK in pelvis coordinates, in the motion loader's tracked-body order."""
+    _, _, v, w, q, dq = decompose_rep_state(rep_state)
+    origin = torch.zeros_like(v)
+    identity = torch.cat((torch.ones_like(v[..., :1]), origin), -1)
+    pos, quat, _, _ = self.fk(origin, identity, q, v, w, dq)
+    return torch.cat((pos.flatten(1), quat_to_rot6d(quat).flatten(1)), -1)
 
 
 class MaxCoordRepresentation(StateRepresentation):
